@@ -1,0 +1,680 @@
+# Copyright © 2019 Province of British Columbia
+#
+# Licensed under the Apache License, Version 2.0 (the 'License');
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an 'AS IS' BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Test suite to ensure Voluntary Dissolution is validated correctly."""
+import copy
+from datetime import datetime, timedelta
+from email.policy import default
+from http import HTTPStatus
+from unittest.mock import MagicMock, patch
+from datetime import date
+
+from legal_api.errors import Error
+from legal_api.services.permissions import PermissionService
+import pytest
+from freezegun import freeze_time
+from registry_schemas.example_data import FILING_HEADER, DISSOLUTION, SPECIAL_RESOLUTION
+from reportlab.lib.pagesizes import letter
+
+from legal_api.models import Business
+from legal_api.services import MinioService, flags
+from legal_api.services.filings.validations import dissolution
+from legal_api.services.filings.validations.dissolution import validate
+from tests.unit.services.filings.test_utils import _upload_file
+from tests.unit.services.filings.validations import create_party, create_party_address, lists_are_equal
+
+
+@pytest.mark.parametrize(
+    'test_status, legal_type, dissolution_type, identifier, expected_code, expected_msg',
+    [
+        ('SUCCESS', 'CP', 'voluntary', 'CP1234567', None, None),
+        ('SUCCESS', 'CP', 'voluntaryLiquidation', 'CP1234567', None, None),
+        ('SUCCESS', 'BC', 'voluntary', 'BC1234567', None, None),
+        ('SUCCESS', 'SP', 'voluntary', 'BC1234567', None, None),
+        ('SUCCESS', 'GP', 'voluntary', 'BC1234567', None, None),
+        ('SUCCESS', 'GP', 'administrative', 'FM1234567', None, None),
+        ('SUCCESS', 'SP', 'administrative', 'FM1234567', None, None),
+        ('SUCCESS', 'CP', 'administrative', 'CP1234567', None, None),
+        ('SUCCESS', 'BC', 'administrative', 'BC1234567', None, None),
+        ('FAIL', 'CP', 'involuntary', 'CP1234567', HTTPStatus.BAD_REQUEST, 'Invalid Dissolution type.'),
+        ('FAIL', 'BC', 'voluntaryLiquidation', 'BC1234567', HTTPStatus.BAD_REQUEST, 'Invalid Dissolution type.'),
+        ('FAIL', 'BEN', 'voluntaryLiquidation', 'BC1234567', HTTPStatus.BAD_REQUEST, 'Invalid Dissolution type.'),
+        ('FAIL', 'CC', 'voluntaryLiquidation', 'BC1234567', HTTPStatus.BAD_REQUEST, 'Invalid Dissolution type.'),
+        ('FAIL', 'ULC', 'voluntaryLiquidation', 'BC1234567', HTTPStatus.BAD_REQUEST, 'Invalid Dissolution type.')
+    ]
+)
+def test_dissolution_type(session, test_status, legal_type, dissolution_type,
+                          identifier, expected_code, expected_msg):  # pylint: disable=too-many-arguments
+    """Assert that a VD can be validated."""
+    # setup
+    business = Business(identifier=identifier, legal_type=legal_type)
+
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    if legal_type != Business.LegalTypes.COOP.value or dissolution_type == 'administrative':
+        del filing['filing']['dissolution']['dissolutionStatementType']
+
+    if dissolution_type == 'administrative':
+        filing['filing']['dissolution']['details'] = "Some Details"
+        del filing['filing']['dissolution']['affidavitFileKey']
+        del filing['filing']['dissolution']['parties']
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    # validate outcomes
+    if expected_code or expected_msg:
+        assert expected_code == err.code
+        assert expected_msg == err.msg[0]['error']
+    else:
+        assert not err
+
+
+@pytest.mark.parametrize(
+    'test_status, legal_type, dissolution_type, dissolution_statement_type, identifier, expected_code, expected_msg',
+    [
+        ('SUCCESS', 'CP', 'voluntary', '197NoAssetsNoLiabilities', 'CP1234567', None, None),
+        ('SUCCESS', 'CP', 'voluntary', '197NoAssetsProvisionsLiabilities', 'CP1234567', None, None),
+        ('FAIL', 'CP', 'voluntary', 'askf', 'CP1234567', HTTPStatus.BAD_REQUEST, 'Invalid Dissolution statement type.'),
+        ('SUCCESS', 'BC', 'voluntary', '', 'BC1234567', None, None)
+    ]
+)
+def test_dissolution_statement_type(session, test_status, legal_type, dissolution_type, dissolution_statement_type,
+                                    identifier, expected_code, expected_msg):  # pylint: disable=too-many-arguments
+    """Assert that a VD can be validated."""
+    # setup
+    business = Business(identifier=identifier, legal_type=legal_type)
+
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionStatementType'] = dissolution_statement_type
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    if legal_type != Business.LegalTypes.COOP.value:
+        del filing['filing']['dissolution']['dissolutionStatementType']
+
+    # perform test
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    # validate outcomes
+    if expected_code or expected_msg:
+        assert expected_code == err.code
+        assert expected_msg == err.msg[0]['error']
+    else:
+        assert not err
+
+@pytest.mark.parametrize(
+    'legal_type, dissolution_type, roles, expected_code, expected_msg',
+    [
+        ('BC', 'voluntary', ['Custodian'], None, None),
+        ('BC', 'voluntary', ['Liquidator'], HTTPStatus.BAD_REQUEST, 'Invalid party role(s) provided: liquidator.'),
+        ('BC', 'voluntary', ['Completing Party'], HTTPStatus.BAD_REQUEST,
+          'Invalid party role(s) provided: completing_party.'),
+        ('BC', 'voluntary', [], HTTPStatus.BAD_REQUEST, 'Must have a minimum of one custodian.'),
+        ('BC', 'voluntary', ['Custodian', 'Custodian'], HTTPStatus.BAD_REQUEST,
+          'Must have a maximum of one custodian.'),        
+
+        ('CP', 'voluntary', ['Custodian'], None, None),
+        ('CP', 'voluntary', ['Liquidator'], None, None),
+        ('CP', 'voluntary', ['Completing Party'], HTTPStatus.BAD_REQUEST,
+          'Invalid party role(s) provided: completing_party.'),
+        ('CP', 'voluntary', [], HTTPStatus.BAD_REQUEST, 'Must have a minimum of one custodian or one liquidator.'),
+        ('CP', 'voluntary', ['Custodian', 'Liquidator'], HTTPStatus.BAD_REQUEST,
+          'Must have a maximum of one custodian or one liquidator, not both.'),        
+
+        ('SP', 'voluntary', ['Completing Party'], None, None),
+        ('GP', 'voluntary', ['Completing Party'], None, None),
+        ('SP', 'voluntary', ['Custodian'], HTTPStatus.BAD_REQUEST, 'Invalid party role(s) provided: custodian.'),
+        ('GP', 'voluntary', ['Liquidator'], HTTPStatus.BAD_REQUEST, 'Invalid party role(s) provided: liquidator.'),
+        ('SP', 'voluntary', [], HTTPStatus.BAD_REQUEST, 'Must have a completing party.'),
+        ('GP', 'voluntary', [], HTTPStatus.BAD_REQUEST, 'Must have a completing party.'),
+
+        ('BC', 'administrative', ['Custodian'], None, None),
+        ('CP', 'administrative', ['Completing Party'], None, None),
+    ]
+)
+def test_dissolution_party_roles(session, legal_type, dissolution_type, roles, expected_code, expected_msg):
+    business = Business(identifier='BC1234567', legal_type=legal_type)
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+
+    base_mailing_address = filing['filing']['dissolution']['parties'][0]['mailingAddress']
+    base_delivery_address = filing['filing']['dissolution']['parties'][0]['deliveryAddress']
+    filing['filing']['dissolution']['parties'] = []
+
+    if dissolution_type == 'administrative':
+        filing['filing']['dissolution']['details'] = "Some Details"
+        del filing['filing']['dissolution']['affidavitFileKey']
+
+    for i, role in enumerate(roles):
+        mailing_addr = create_party_address(base_address=base_mailing_address)
+        delivery_addr = create_party_address(base_address=base_delivery_address)
+        p = create_party([role], i + 1, mailing_addr, delivery_addr)
+        filing['filing']['dissolution']['parties'].append(p)
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    if expected_code:
+        assert err.code == expected_code
+        assert expected_msg in err.msg[0]['error']
+    else:
+        assert err is None
+
+
+@pytest.mark.parametrize(
+    'test_status, legal_type, address_validation, identifier, expected_code, expected_msg',
+    [
+        ('FAIL', 'CP', 'not_in_ca', 'CP1234567', HTTPStatus.BAD_REQUEST, 'Address must be in Canada.'),
+        ('FAIL', 'BC', 'not_in_bc', 'BC1234567', HTTPStatus.BAD_REQUEST, 'Address must be in BC.'),
+        ('PASS', 'SP', 'not_in_bc', 'FM1234567', None, None),
+        ('PASS', 'GP', 'not_in_bc', 'FM1234567', None, None),
+        ('FAIL', 'BC', 'mailing_address_required', 'BC1234567',
+         HTTPStatus.BAD_REQUEST, 'mailingAddress is required.'),
+        ('FAIL', 'BC', 'party_address_required', 'BC1234567',
+         HTTPStatus.BAD_REQUEST, 'Dissolution party is required.'),
+        ('FAIL', 'CP', 'lookup_error', 'CP1234567',
+         HTTPStatus.BAD_REQUEST, 'Address Country must resolve to a valid ISO-2 country.')
+    ]
+)
+def test_dissolution_address(session, test_status, legal_type, address_validation,
+                             identifier, expected_code, expected_msg):  # pylint: disable=too-many-arguments
+    """Assert that a VD can be validated."""
+    # setup
+    business = Business(identifier=identifier, legal_type=legal_type)
+
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    if legal_type != Business.LegalTypes.COOP.value:
+        del filing['filing']['dissolution']['dissolutionStatementType']
+
+    if address_validation in ['not_in_ca', 'not_in_bc']:
+        if legal_type == Business.LegalTypes.COOP.value:
+            filing['filing']['dissolution']['parties'][1]['mailingAddress']['addressCountry'] = 'US'
+        elif legal_type == Business.LegalTypes.COMP.value:
+            filing['filing']['dissolution']['parties'][1]['mailingAddress']['addressRegion'] = 'AB'
+    elif address_validation == 'mailing_address_required':
+        del filing['filing']['dissolution']['parties'][1]['mailingAddress']
+    elif address_validation == 'party_address_required':
+        filing['filing']['dissolution']['parties'] = []
+    elif address_validation == 'lookup_error':
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']['addressCountry'] = 'adssadkj'
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    # validate outcomes
+    if expected_code or expected_msg:
+        assert expected_code == err.code
+        assert expected_msg == err.msg[0]['error']
+    else:
+        assert not err
+
+
+@pytest.mark.parametrize(
+    'test_name, legal_type, dissolution_type, identifier, has_special_resolution_filing, expected_code, expected_msg',
+    [
+        ('SUCCESS', 'BC', 'voluntary', 'BC1234567', False, None, None),
+        ('SUCCESS', 'CP', 'voluntary', 'CP1234567', True, None, None),
+        ('FAIL_REQUIRED_SPECIAL_RESOLUTIONS', 'CP', 'voluntary', 'CP1234567', False,
+         HTTPStatus.BAD_REQUEST, [{'error': 'Special Resolution is required.', 'path': '/filing/specialResolution'}])
+    ]
+)
+def test_dissolution_special_resolution(session, test_name, legal_type, dissolution_type,
+                                        identifier, has_special_resolution_filing, expected_code, expected_msg):  # pylint: disable=too-many-arguments
+    """Assert that special resolution can be validated."""
+    from legal_api.services.filings import validate
+    # setup
+    business = Business(identifier=identifier, legal_type=legal_type)
+
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+    if has_special_resolution_filing:
+        filing['filing']['specialResolution'] = copy.deepcopy(SPECIAL_RESOLUTION)
+        resolution_date_str = filing['filing']['specialResolution']['resolutionDate']
+        resolution_date_time = datetime.strptime(resolution_date_str, '%Y-%m-%d')
+        business.founding_date = resolution_date_time - timedelta(days=1000)
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    # validate outcomes
+    if expected_code:
+        assert err.code == expected_code
+        assert lists_are_equal(err.msg, expected_msg)
+    else:
+        assert err is None
+
+
+@pytest.mark.parametrize(
+    'test_name, legal_type, dissolution_type, key, scenario, identifier, expected_code, expected_msg',
+    [
+        ('SUCCESS', 'BC', 'voluntary', '', 'success', 'BC1234567', None, None),
+        ('SUCCESS', 'CP', 'voluntary', '', 'success', 'CP1234567', None, None),
+        ('FAIL_INVALID_AFFIDAVIT_FILE_KEY', 'CP', 'voluntary', 'affidavitFileKey', 'failAffidavit', 'CP1234567',
+         HTTPStatus.BAD_REQUEST, [{
+             'error': 'Invalid file.', 'path': '/filing/dissolution/affidavitFileKey'
+         }]),
+        ('FAIL_REQUIRED_AFFIDAVIT_FILE_KEY', 'CP', 'voluntary', 'affidavitFileKey', '', 'CP1234567',
+         HTTPStatus.BAD_REQUEST, [{
+             'error': 'A valid affidavit key is required.', 'path': '/filing/dissolution/affidavitFileKey'
+         }]),
+        ('FAIL_INVALID_AFFIDAVIT_FILE', 'CP', 'voluntary', 'affidavitFileKey', 'invalidAffidavitPageSize', 'CP1234567',
+         HTTPStatus.BAD_REQUEST, [{
+             'error': 'Document must be set to fit onto 8.5” x 11” letter-size paper.',
+             'path': '/filing/dissolution/affidavitFileKey'
+         }]),
+    ]
+)
+def test_dissolution_affidavit(session, minio_server, test_name, legal_type, dissolution_type, key, scenario,
+                               identifier, expected_code, expected_msg):  # pylint: disable=too-many-arguments
+    """Assert that an affidavit can be validated."""
+    # setup
+    business = Business(identifier=identifier, legal_type=legal_type)
+
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    if scenario:
+        if scenario == 'success':
+            if legal_type == Business.LegalTypes.COOP.value:
+                filing['filing']['dissolution']['affidavitFileKey'] = _upload_file(letter, invalid=False)
+            else:
+                del filing['filing']['dissolution']['affidavitFileKey']
+        elif scenario == 'failAffidavit':
+            filing['filing']['dissolution']['affidavitFileKey'] = 'invalid file key'
+        elif scenario == 'invalidAffidavitPageSize':
+            filing['filing']['dissolution']['affidavitFileKey'] = _upload_file(letter, invalid=True)
+    else:
+        # Assign key and value to test empty variables for failures
+        key_value = ''
+        filing['filing']['dissolution'][key] = key_value
+
+    with patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    # validate outcomes
+    if expected_code:
+        assert err.code == expected_code
+        assert lists_are_equal(err.msg, expected_msg)
+    else:
+        assert err is None
+
+    # Cleanup
+    if file_key := filing['filing']['dissolution'].get('affidavitFileKey', None):
+        MinioService.delete_file(file_key)
+
+
+@pytest.mark.parametrize(
+    'test_status, file_number, effect_of_order, expected_code, expected_msg',
+    [
+        ('FAIL', None, 'planOfArrangement', HTTPStatus.BAD_REQUEST, 'Court order file number is required.'),
+        ('FAIL', '12345678901234567890', 'invalid', HTTPStatus.BAD_REQUEST, 'Invalid effectOfOrder.'),
+        ('SUCCESS', '12345678901234567890', 'planOfArrangement', None, None)
+    ]
+)
+def test_dissolution_court_orders(session, test_status, file_number, effect_of_order, expected_code, expected_msg):
+    """Assert valid court orders."""
+    business = Business(identifier='BC1234567')
+
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = 'BC'
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    court_order = {
+        'effectOfOrder': effect_of_order
+    }
+
+    if file_number:
+        court_order['fileNumber'] = file_number
+
+    filing['filing']['dissolution']['courtOrder'] = court_order
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    # validate outcomes
+    if test_status == 'FAIL':
+        assert expected_code == err.code
+        assert expected_msg == err.msg[0]['error']
+    else:
+        assert not err
+
+
+@pytest.mark.parametrize(
+    'test_status, legal_type, dissolution_type, email, expected_code, expected_msg',
+    [
+        # Required email cases (missing or None)
+        ('FAIL', 'BC', 'voluntary', None, HTTPStatus.BAD_REQUEST,
+         'Custodian email is required for voluntary dissolution.'),
+        ('FAIL', 'BEN', 'voluntary', None, HTTPStatus.BAD_REQUEST,
+         'Custodian email is required for voluntary dissolution.'),
+        ('FAIL', 'CC', 'voluntary', None, HTTPStatus.BAD_REQUEST,
+         'Custodian email is required for voluntary dissolution.'),
+        ('FAIL', 'ULC', 'voluntary', None, HTTPStatus.BAD_REQUEST,
+         'Custodian email is required for voluntary dissolution.'),
+
+        # Whitespace-only emails
+        ('FAIL', 'BC', 'voluntary', ' ', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+        ('FAIL', 'BC', 'voluntary', '   ', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+        ('FAIL', 'BC', 'voluntary', '\t', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+        ('FAIL', 'BC', 'voluntary', '\n', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+
+        # Leading/trailing/middle whitespace
+        ('FAIL', 'BC', 'voluntary', ' test@example.com', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+        ('FAIL', 'BC', 'voluntary', 'test@example.com ', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+        ('FAIL', 'BC', 'voluntary', 'te st@example.com', HTTPStatus.BAD_REQUEST,
+         'Custodian email cannot contain any whitespaces.'),
+
+        # Valid emails (no whitespace)
+        ('SUCCESS', 'CP', 'voluntary', None, None, None),
+        ('SUCCESS', 'BC', 'voluntary', 'test@example.com', None, None),
+        ('SUCCESS', 'BEN', 'voluntary', 'test@example.com', None, None),
+        ('SUCCESS', 'CC', 'voluntary', 'test@example.com', None, None),
+        ('SUCCESS', 'ULC', 'voluntary', 'test@example.com', None, None),
+        ('SUCCESS', 'BC', 'administrative', None, None, None),
+    ]
+)
+def test_dissolution_custodian_email(session, test_status, legal_type, dissolution_type,
+                                     email, expected_code, expected_msg):
+    """Test custodian email validation in voluntary dissolution."""
+    business = Business(identifier='BC1234567', legal_type=legal_type)
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    officer = filing['filing']['dissolution']['parties'][1]['officer']
+    if email is None:
+        officer.pop('email', None)
+    else:
+        officer['email'] = email
+
+    if dissolution_type == 'administrative':
+        filing['filing']['dissolution']['details'] = "Some Details"
+        del filing['filing']['dissolution']['affidavitFileKey']
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    if test_status == 'FAIL':
+        assert err.code == expected_code
+        assert any(expected_msg in msg['error'] for msg in err.msg)
+    else:
+        assert err is None
+
+@pytest.mark.parametrize(
+    'test_status, legal_type, dissolution_type, party_type, org_name, expected_code, expected_msg',
+    [
+        # Required organization name cases
+        ('FAIL', 'BC', 'voluntary', 'organization', '', HTTPStatus.BAD_REQUEST,
+         'Organization name is required.'),
+        ('FAIL', 'BC', 'voluntary', 'organization', '   ', HTTPStatus.BAD_REQUEST,
+         'Organization name is required.'),
+
+        # Leading/trailing whitespace
+        ('FAIL', 'BC', 'voluntary', 'organization', '  LeadingSpace', HTTPStatus.BAD_REQUEST,
+         'Organization name cannot have leading or trailing spaces.'),
+        ('FAIL', 'BC', 'voluntary', 'organization', 'TrailingSpace  ', HTTPStatus.BAD_REQUEST,
+         'Organization name cannot have leading or trailing spaces.'),
+        ('FAIL', 'BC', 'voluntary', 'organization', '  BothSides  ', HTTPStatus.BAD_REQUEST,
+         'Organization name cannot have leading or trailing spaces.'),
+
+        # Valid name
+        ('SUCCESS', 'BC', 'voluntary', 'organization', 'Test Org', None, None),
+
+        # Non-organization party types should skip validation
+        ('SUCCESS', 'BC', 'voluntary', 'person', None, None, None),
+
+        # Legal types other than CORP should skip validation
+        ('SUCCESS', 'CP', 'voluntary', 'organization', None, None, None),
+        ('SUCCESS', 'BC', 'administrative', 'organization', None, None, None),
+    ]
+)
+def test_dissolution_custodian_org_name(session, test_status, legal_type, dissolution_type,
+                                        party_type, org_name, expected_code, expected_msg):
+    """Test custodian organization name validation and trimming."""
+
+    business = Business(identifier='BC1234567', legal_type=legal_type)
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = legal_type
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = dissolution_type
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    if dissolution_type == 'administrative':
+        filing['filing']['dissolution']['details'] = "Some Details"
+        del filing['filing']['dissolution']['affidavitFileKey']
+
+    officer = filing['filing']['dissolution']['parties'][1]['officer']
+    officer['partyType'] = party_type
+    if org_name is not None:
+        officer['organizationName'] = org_name
+    elif 'organizationName' in officer:
+        del officer['organizationName']
+
+    with patch.object(dissolution, 'validate_affidavit', return_value=None), \
+         patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+        err = validate(business, filing)
+
+    if test_status == 'FAIL':
+        assert err.code == expected_code
+        assert any(expected_msg in msg['error'] for msg in err.msg)
+    else:
+        assert err is None
+
+#setup
+now = date(2020, 9, 17)
+
+@pytest.mark.parametrize(
+    'test_name, effective_date , expected_code, expected_msg',
+    [
+        ('SUCCESS', '2020-09-18T00:00:00+00:00', None, None),
+        ('SUCCESS', None, None, None),
+        ('FAIL_INVALID_DATE_TIME_FORMAT', '2020-09-18T00:00:00Z',
+            HTTPStatus.BAD_REQUEST, [{
+                'error': '2020-09-18T00:00:00Z is an invalid ISO format for effectiveDate.',
+                'path': '/filing/header/effectiveDate'
+            }]),
+        ('FAIL_INVALID_DATE_TIME_MINIMUM', '2020-09-17T00:01:00+00:00',
+            HTTPStatus.BAD_REQUEST, [{
+                'error': 'Invalid Datetime, effective date must be a minimum of 2 minutes ahead.',
+                'path': '/filing/header/effectiveDate'
+            }]),
+        ('FAIL_INVALID_DATE_TIME_MAXIMUM', '2020-09-27T00:01:00+00:00',
+            HTTPStatus.BAD_REQUEST, [{
+                'error': 'Invalid Datetime, effective date must be a maximum of 10 days ahead.',
+                'path': '/filing/header/effectiveDate'
+            }])
+    ])
+def test_dissolution_effective_date(session, test_name,
+                                               effective_date, expected_code, expected_msg):
+    """Test effective date validation in voluntary dissolution."""
+    business = Business(identifier='BC1234567', legal_type='BC')
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = 'BC'
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = 'voluntary'
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    if effective_date is not None:
+        filing['filing']['header']['effectiveDate'] = effective_date
+
+    # perform test
+    with freeze_time(now), patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None), \
+            patch('legal_api.services.filings.validations.dissolution.check_good_standing_permission', return_value=None):
+      err = validate(business, filing)
+
+    if expected_code:
+        assert err.code == expected_code
+        assert lists_are_equal(err.msg, expected_msg)
+    else:
+        assert err is None
+
+
+@pytest.mark.parametrize(
+    'test_name, good_standing, has_permission, flag_enabled, expected_code, expected_msg',
+    [
+        ('SUCCESS_GOOD_STANDING_WITH_FLAG', True, False, True, None, None),
+        ('SUCCESS_NOT_GOOD_STANDING_WITH_PERMISSION', False, True, True, None, None),
+        ('FAIL_NOT_GOOD_STANDING_NO_PERMISSION_WITH_FLAG', False, False, True,
+         HTTPStatus.FORBIDDEN, 'Permission Denied - You do not have permissions send not in good standing business in this filing.')
+         ])
+def test_dissolution_good_standing_permission(session, test_name, good_standing, has_permission, flag_enabled, expected_code, expected_msg):
+    """Test good standing validation in voluntary dissolution."""
+    business = Business(identifier='BC1234567', legal_type='BC')
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['header']['name'] = 'dissolution'
+    filing['filing']['business']['legalType'] = 'BC'
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    filing['filing']['dissolution']['dissolutionType'] = 'voluntary'
+    filing['filing']['dissolution']['parties'][1]['deliveryAddress'] = \
+        filing['filing']['dissolution']['parties'][1]['mailingAddress']
+
+    permission_error = None if has_permission else Error(
+        HTTPStatus.FORBIDDEN, 
+        [{'message': 'Permission Denied - You do not have permissions send not in good standing business in this filing.'}],
+    )
+
+    with (
+        patch.object(flags, 'is_on', return_value=flag_enabled),
+        patch.object(Business, 'good_standing', new_callable=lambda: good_standing),
+        patch.object(PermissionService, 'check_user_permission', return_value=permission_error),
+        patch.object(dissolution, 'validate_dissolution_parties_roles', return_value=None),
+        patch.object(dissolution, 'validate_affidavit', return_value=None),
+        patch.object(dissolution, 'check_good_standing_permission', return_value=permission_error if not good_standing  and not has_permission and flag_enabled else None),
+        patch.object(dissolution, 'validate_permission_and_completing_party', return_value=None),
+        patch.object(dissolution, '_check_dissolution_permission', return_value=None),
+    ):
+        err = validate(business, filing)
+
+    if expected_code:
+        assert err is not None
+        assert err.code == expected_code
+        if expected_msg:
+            assert lists_are_equal(err.msg, [{'message': expected_msg}])
+    else:
+        assert err is None
+        
+@pytest.mark.parametrize(
+    'test_name, dissolution_permission_error, completing_party_exists, account_id, has_parties, completing_party_result , legal_type, document_optional_email, email_validation_result, completing_party_permission_error, expected_error',
+    [
+        ('SUCCESS_NO_ERRORS', None, False, None, False, None, 'BC', None, None, None, None),
+        ('FAIL_DISSOLUTION_PERMISSION_ERROR', Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied'}]), False, None, False, None, 'BC', None, None, None, Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied'}])),
+        ('SUCCESS_COMPLETING_PARTY_NO_CHANGES', None, True, '123', True, {'error': [], 'email_changed': False, 'name_changed': False, 'address_changed': False}, 'SP', None, None, None, None),
+        ('FAIL_COMPLETING_PARTY_EMAIL_CHANGED_NO_PERMISSION', None, True, '123', True, {'error': [], 'email_changed': True, 'name_changed': False, 'address_changed': False}, 'SP', None, None, Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}]), Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}])),
+        ('FAIL_COMPLETING_PARTY_NAME_CHANGED_NO_PERMISSION', None, True, '123', True, {'error': [], 'email_changed': False, 'name_changed': True, 'address_changed': False}, 'SP', None, None, Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}]), Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}])),
+        ('FAIL_COMPLETING_PARTY_ADDRESS_CHANGED_NO_PERMISSION', None, True, '123', True, {'error': [], 'email_changed': False, 'name_changed': False, 'address_changed': True}, 'SP', None, None, Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}]), Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}])),
+        ('FAIL_DOCUMENT_EMAIL_PERMISSION_ERROR', None, False, '123', False, None, 'BC', 'test@example.com', {'errors': [], 'email_changed': True}, Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}]), Error(HTTPStatus.FORBIDDEN, [{'message': 'Permission Denied: You do not have permission to edit the completing party.'}])),
+    ]
+)
+def test_dissolution_validate_dissolution_permission_and_completing_party(
+    session, test_name, dissolution_permission_error, completing_party_exists, account_id, has_parties, completing_party_result, legal_type,
+    document_optional_email, email_validation_result, completing_party_permission_error, expected_error):
+    """Test _validate_dissolution_permission and validate_completing_party_permission methods."""
+    business = Business(identifier='BC1234567', legal_type=legal_type)
+    filing = copy.deepcopy(FILING_HEADER)
+    filing['filing']['dissolution'] = copy.deepcopy(DISSOLUTION)
+    msg = []
+    if has_parties:
+        filing['filing']['dissolution']['parties'] = [{'roles': [{'roleType': 'completing_party'}]}]
+    if document_optional_email:
+        filing['filing']['header']['documentOptionalEmail'] = document_optional_email
+    mock_request = MagicMock()
+    if account_id:
+        def mock_get(key, default=None):
+            if key in ('account-id', 'accountId'):
+                return account_id
+            return None
+        mock_request.headers = MagicMock()
+        mock_request.headers.get = MagicMock(side_effect=mock_get)
+    else:
+        mock_request.headers.get = MagicMock(return_value=None)
+    with (
+        patch.object(dissolution, 'check_good_standing_permission', return_value=None),
+        patch.object(dissolution, '_check_dissolution_permission', return_value=dissolution_permission_error),
+        patch('legal_api.services.filings.validations.common_validations.has_completing_party', return_value=completing_party_exists),
+        patch('legal_api.services.filings.validations.common_validations.validate_completing_party', return_value=completing_party_result),
+        patch('legal_api.services.filings.validations.common_validations.validate_document_delivery_email_changed', return_value=email_validation_result if email_validation_result else {'errors': [], 'email_changed': False}),
+        patch('legal_api.services.filings.validations.common_validations.check_completing_party_permission', return_value=completing_party_permission_error),
+        patch('legal_api.services.filings.validations.common_validations.get_request_context', return_value=MagicMock() if account_id else None),
+        patch('legal_api.services.filings.validations.common_validations.request', mock_request),
+        patch.object(flags, 'is_on', return_value=True),
+        ):
+        err = dissolution._validate_dissolution_permission(
+            business,filing,'voluntary','dissolution',msg)
+        if expected_error:
+            assert err is not None
+            assert err.code == expected_error.code
+        else:
+            assert err is None

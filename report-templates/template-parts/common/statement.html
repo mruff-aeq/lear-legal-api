@@ -1,0 +1,31 @@
+{% if business.legalType in ['BEN', 'CBEN'] %}
+  <div class="no-page-break">
+    <div class="section-title mt-4">BC Benefit Company Statement</div>
+    <div class="section-data mt-4">
+      {% if enable_new_ben_statements %}
+          This company is a benefit company and, as such, is committed to conducting its
+          business in a responsible and sustainable manner and promoting one or more public benefits.
+      {% else %}
+        This company is a benefit company and, as such, has purposes that include conducting its
+        business in a responsible and sustainable manner and promoting one or more public benefits.
+      {% endif %}  
+    </div>
+  </div>
+{% elif business.legalType in ['CC', 'CCC'] %}
+  <div class="no-page-break">
+    <div class="section-title mt-4">BC Community Contribution Company Statement</div>
+    <div class="section-data mt-4">
+      This company is a community contribution company and, as such, has purposes beneficial to society.
+      This company is restricted, in accordance with Part 2.2 of the BCA, in its ability to pay dividends and to
+      distribute its assets on dissolution or otherwise.
+    </div>
+  </div>
+{% elif business.legalType in ['ULC', 'CUL'] %}
+  <div class="no-page-break">
+    <div class="section-title mt-4">BC Unlimited Liability Company Statement</div>
+    <div class="section-data mt-4">
+      The shareholders of this company are jointly and severally liable to satisfy the debts and
+      liabilities of this company to the extent provided in section 51.3 of the Business Corporations Act.
+    </div>
+  </div>
+{% endif %}    

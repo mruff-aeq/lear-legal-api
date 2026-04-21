@@ -1,0 +1,61 @@
+[[macros.html]]
+<!DOCTYPE html>
+<html lang="en">
+   <head>
+      <title>Register Correction Application</title>
+      <meta charset="UTF-8">
+      <meta name="author" content="BC Registries and Online Services">
+      [[common/style.html]]
+   </head>
+   <body>
+      <div class="header">
+         <table class="header-table" role="presentation">
+            <tr class="no-page-break">
+               <td>
+                  [[logo.html]]
+               </td>
+               <td>
+                  <div class="report-type">
+                     REGISTER CORRECTION APPLICATION
+                  </div>
+                  <div class="report-type-desc">{{ entityDescription }} - {{ entityAct }}</div>
+               </td>
+            </tr>
+         </table>
+         <div class="business-name-header">
+            <label class="lbl-business-name">
+            {{ business.legalName }}
+            </label>
+         </div>
+      </div>
+      [[correction/businessDetails.html]]
+
+      <div class="container">
+         [[correction/legalNameChange.html]]
+         
+         {% if nameTranslationsChange %}
+            [[common/nameTranslation.html]]
+         {% endif %}
+         
+         [[correction/addresses.html]]
+
+         [[correction/directors.html]]
+
+         {% if shareClasses and (shareClassesChange or newShareClasses or ceasedShareClasses) %}
+            [[common/shareStructure.html]]
+         {% endif %}
+         
+         [[common/resolutionDates.html]]
+
+         [[correction/associateType.html]]
+         [[correction/rulesMemorandum.html]]
+         [[correction/resolution.html]]
+      </div>
+      <div class="container business-details-table" >
+         <div class="separator mb-4"></div>
+         <div class="bold"><span class="details-header-text"> Correction Detail</span><span class="correction-label-added">ADDED</span></div>
+         <div class="pt-2">Correction filed by Registry Staff on {{effective_date_time}}</div>
+         <div class="pt-2 preserve-line-breaks"><span>{{correction.comment}}</span></div>
+      </div>
+   </body>
+</html>

@@ -1,0 +1,49 @@
+{
+  "flagValues": {
+    "string-flag": "a string value",
+    "bool-flag": true,
+    "integer-flag": 10,
+    "enable-legal-name-fix": true,
+    "enable-sandbox": false,
+    "enable-business-summary-for-migrated-corps": true,
+    "enable-document-records": false,
+    "enable-involuntary-dissolution-filter": false,
+    "enable-new-ben-statements": false,
+    "enable-auth-v2-business": true,
+    "enable-auth-v2-filing": true,
+    "enable-permissions-for-action": false,
+    "enabled-deeper-permission-action": false,
+    "enable-edit-completing-party-permission": false,
+    "enabled-specific-filings": "",
+    "involuntary-dissolution-filter": {
+      "include-accounts": [],
+      "exclude-accounts": []
+    },
+    "db-versioning": {
+      "legal-api": true,
+      "emailer": true,
+      "filer": true,
+      "entity-bn": true,
+      "digital-credentials": true,
+      "dissolutions-job": true,
+      "furnishings-job": true,
+      "emailer-reminder-job": true
+    },
+    "dbc-enabled-business-types": {
+      "types": ["SP"]
+    },
+    "enable-officers-business-summary": false,
+    "supported-change-of-officers-entities": false,
+    "enabled-business-summary-entities": "CP BEN SP GP CBEN BC CC ULC C CCC CUL",
+    "supported-amalgamation-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "supported-amalgamation-out-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "supported-consent-amalgamation-out-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "supported-put-back-on-entities": "BC BEN CC ULC C CBEN CCC CUL CP",
+    "supported-continuation-in-entities": "C CBEN CCC CUL",
+    "support-agm-extension-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "supported-agm-location-change-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "supported-continuation-out-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "supported-consent-continuation-out-entities": "BC BEN CC ULC C CBEN CCC CUL",
+    "enable-backdated-cod": false
+  }
+}

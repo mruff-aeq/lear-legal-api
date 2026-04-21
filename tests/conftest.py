@@ -1,0 +1,351 @@
+# Copyright © 2019 Province of British Columbia
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Common setup and fixtures for the pytest suite used by this service."""
+from datetime import datetime, timezone
+import time
+from contextlib import contextmanager, suppress
+import re
+import pytest
+from unittest.mock import Mock, patch
+import json
+from http import HTTPStatus
+
+from flask_migrate import Migrate, upgrade
+from ldclient.integrations.test_data import TestData
+from minio.error import S3Error
+from testcontainers.postgres import PostgresContainer
+from sqlalchemy import event, text
+from sqlalchemy.schema import MetaData
+import requests_mock
+
+from legal_api import create_app
+from legal_api import jwt as _jwt
+from legal_api.config import TestConfig
+from legal_api.models import db as _db
+
+
+@contextmanager
+def not_raises(exception):
+    """Corallary to the pytest raises builtin.
+
+    Assures that an exception is NOT thrown.
+    """
+    try:
+        yield
+    except exception:
+        raise pytest.fail(f'DID RAISE {exception}')
+
+
+@pytest.fixture
+def freeze_datetime_utcnow():
+    """Freeze time for testing.
+    
+    super().now(tz=timezone.utc) is not supported by freezegun.
+    So we mock datetime.utcnow() directly.
+    """
+    @contextmanager
+    def _freeze_time(frozen_datetime):
+        with patch('legal_api.utils.datetime.datetime') as mock_datetime:
+            mock_datetime.utcnow.return_value = frozen_datetime.replace(tzinfo=timezone.utc)
+            yield
+    return _freeze_time
+
+
+@pytest.fixture(scope="session")
+def ld():
+    """LaunchDarkly TestData source."""
+    td = TestData.data_source()
+    with open("flags.json") as file:
+        data = file.read()
+        test_flags: dict[str, dict] = json.loads(data)
+        for flag_name, flag_value in test_flags["flagValues"].items():
+            # NOTE: should check if isinstance dict and if so, apply each variation
+            td.update(td.flag(flag_name).variations(flag_value))
+    yield td
+
+
+@pytest.fixture(scope="session")
+def monkey_session():
+    """Return a session-wide monkeypatching fixture."""
+    mp = pytest.MonkeyPatch()
+    yield mp
+    mp.undo()
+
+
+@pytest.fixture(scope='session')
+def app(monkey_session, ld):
+    """Return a session-wide application configured in TEST mode."""
+    options = {
+        'ld_test_data':ld,
+    }
+    _app = create_app("testing", **options)
+
+    def _utcnow_side_effect():
+        """super().now(tz=timezone.utc) is not supported by freezegun, so we mock datetime.utcnow() directly."""
+        return datetime.now(tz=timezone.utc)
+    monkey_session.setattr('legal_api.utils.datetime.datetime.utcnow', _utcnow_side_effect)
+
+
+    def _now_side_effect():
+        """super().now() is not supported by freezegun, so we mock datetime.now() directly."""
+        return datetime.now()
+    monkey_session.setattr('legal_api.utils.datetime.datetime.now', _now_side_effect)
+
+    return _app
+
+
+@pytest.fixture(scope='function')
+def app_ctx(ld, event_loop):
+    # def app_ctx():
+    """Return a session-wide application configured in TEST mode."""
+    options = {
+        'ld_test_data':ld,
+    }
+    _app = create_app("testing", **options)
+    with _app.app_context():
+        yield _app
+
+
+@pytest.fixture
+def config(app):
+    """Return the application config."""
+    return app.config
+
+
+@pytest.fixture(scope='function')
+def app_request(ld):
+    """Return a session-wide application configured in TEST mode."""
+    options = {
+        'ld_test_data':ld,
+    }
+    _app = create_app("testing", **options)
+
+    return _app
+
+
+@pytest.fixture(scope='session')
+def client(app):  # pylint: disable=redefined-outer-name
+    """Return a session-wide Flask test client."""
+    return app.test_client()
+
+
+@pytest.fixture(scope='session')
+def jwt():
+    """Return a session-wide jwt manager."""
+    return _jwt
+
+
+@pytest.fixture(scope='session')
+def client_ctx(app):  # pylint: disable=redefined-outer-name
+    """Return session-wide Flask test client."""
+    with app.test_client() as _client:
+        yield _client
+
+
+@pytest.fixture(scope='session')
+def db(app):  # pylint: disable=redefined-outer-name, invalid-name
+    """Return a session-wide initialised database.
+
+    Drops all existing tables - Meta follows Postgres FKs
+    """
+    with app.app_context():
+        # Clear out any existing tables
+        metadata = MetaData(_db.engine)
+        metadata.reflect()
+        with suppress(Exception):
+            metadata.drop_all()
+        with suppress(Exception):
+            _db.drop_all()
+
+        sequence_sql = """SELECT sequence_name FROM information_schema.sequences
+                          WHERE sequence_schema='public'
+                       """
+
+        sess = _db.session()
+        for seq in [name for (name,) in sess.execute(text(sequence_sql))]:
+            with suppress(Exception):
+                sess.execute(text('DROP SEQUENCE public.%s ;' % seq))
+                print('DROP SEQUENCE public.%s ' % seq)
+        sess.commit()
+
+        # drop enums
+        enum_type_sql = "SELECT typname FROM pg_type WHERE typcategory = 'E'"
+        for enum_name in [name for (name,) in sess.execute(text(enum_type_sql))]:
+            with suppress(Exception):
+                sess.execute(text('DROP TYPE %s ;' % enum_name))
+                print('DROP TYPE %s ' % enum_name)
+        sess.commit()
+
+        # For those who have local databases on bare metal in local time.
+        # Otherwise some of the returns will come back in local time and unit tests will fail.
+        # The current DEV database uses UTC.
+        sess.execute("SET TIME ZONE 'UTC';")
+        sess.commit()
+
+        # ############################################
+        # There are 2 approaches, an empty database, or the same one that the app will use
+        #     create the tables
+        #     _db.create_all()
+        # or
+        # Use Alembic to load all of the DB revisions including supporting lookup data
+        # This is the path we'll use in legal_api!!
+
+        # even though this isn't referenced directly, it sets up the internal configs that upgrade needs
+        Migrate(app, _db)
+        upgrade()
+
+        return _db
+
+
+@pytest.fixture(scope='function')
+def session(app, db):  # pylint: disable=redefined-outer-name, invalid-name
+    """Return a function-scoped session."""
+    with app.app_context():
+        conn = db.engine.connect()
+        txn = conn.begin()
+
+        options = dict(bind=conn, binds={})
+        sess = db.create_scoped_session(options=options)
+
+        # establish  a SAVEPOINT just before beginning the test
+        # (http://docs.sqlalchemy.org/en/latest/orm/session_transaction.html#using-savepoint)
+        sess.begin_nested()
+
+        @event.listens_for(sess(), 'after_transaction_end')
+        def restart_savepoint(sess2, trans):  # pylint: disable=unused-variable
+            # Detecting whether this is indeed the nested transaction of the test
+            if trans.nested and not trans._parent.nested:  # pylint: disable=protected-access
+                # Handle where test DOESN'T session.commit(),
+                sess2.expire_all()
+                sess.begin_nested()
+
+        db.session = sess
+
+        sql = text('select 1')
+        sess.execute(sql)
+
+        yield sess
+
+        # Cleanup
+        sess.remove()
+        # This instruction rollsback any commit that were executed in the tests.
+        txn.rollback()
+        conn.close()
+
+
+@pytest.fixture()
+def minio_server(monkeypatch):
+    """Create the minio services that the integration tests will use."""
+    mock_url = 'https://dummy-minio-url.com/businesses'
+    minio_mock = Mock()
+
+    def _presigned_url_side_effect(bucket_name, key, *args, **kwargs):
+        return f'{mock_url}/{key}'
+
+    def _put_object_side_effect(bucket_name, key, data, *args, **kwargs):
+        # The 'data' argument is a file-like object, read its content.
+        # Ensure it's read to the end for completeness, but typically only one read is needed.
+        file_content = data.read()
+        minio_mock.stored_objects[key] = file_content
+        return None
+
+    def _get_object_side_effect(bucket_name, key, *args, **kwargs):
+        if key in minio_mock.stored_objects:
+            mock_file = Mock()
+            mock_file.data = minio_mock.stored_objects[key]
+            return mock_file
+        raise S3Error("NoSuchKey", "Object does not exist", None, None, None, None)
+
+    def _get_info_side_effect(bucket_name, key, *args, **kwargs):
+        if key in minio_mock.stored_objects:
+            mock_file = Mock()
+            mock_file.size = len(minio_mock.stored_objects[key])
+            return mock_file
+        raise S3Error("NoSuchKey", "Object does not exist", None, None, None, None)
+
+    def _remove_object_side_effect(bucket_name, key, *args, **kwargs):
+        if key in minio_mock.stored_objects:
+            del minio_mock.stored_objects[key]
+        return None
+
+    minio_mock.stored_objects = {}
+
+    minio_mock.presigned_get_object.side_effect = _presigned_url_side_effect
+    minio_mock.presigned_put_object.side_effect = _presigned_url_side_effect
+    minio_mock.stat_object.side_effect = _get_info_side_effect
+    minio_mock.get_object.side_effect = _get_object_side_effect
+    minio_mock.remove_object.side_effect = _remove_object_side_effect
+    minio_mock.put_object.side_effect = _put_object_side_effect
+
+    monkeypatch.setattr('legal_api.services.minio.MinioService._get_client', lambda: minio_mock)
+    with requests_mock.Mocker() as mock:
+        def _mock_put_side_effect(request, context):
+            key = request.url.replace(f'{mock_url}/', '', 1)
+            minio_mock.stored_objects[key] = request.body
+            context.status_code = HTTPStatus.CREATED
+            return None
+
+        def _mock_get_side_effect(request, context):
+            key = request.url.replace(f'{mock_url}/', '', 1)
+            content = minio_mock.stored_objects.get(key)
+            if content is not None:
+                context.status_code = HTTPStatus.OK
+                return content
+            else:
+                raise S3Error("NoSuchKey", "Object does not exist", None, None, None, None)
+
+        mock.put(re.compile(f"{mock_url}.*"), json=_mock_put_side_effect)
+        mock.get(re.compile(f"{mock_url}.*"), content=_mock_get_side_effect)
+
+        yield minio_mock
+
+
+DOCUMENT_API_URL = 'http://document-api.com'
+DOCUMENT_API_VERSION = '/api/v1'
+DOCUMENT_SVC_URL = f'{DOCUMENT_API_URL + DOCUMENT_API_VERSION}'
+DOCUMENT_PRODUCT_CODE = 'BUSINESS'
+
+@pytest.fixture()
+def mock_doc_service():
+    mock_response = {
+        'identifier': 1,
+        'url': 'https://document-service.com/document/1'
+    }
+    with requests_mock.Mocker(real_http=True) as mock:
+        post_url = f'{DOCUMENT_SVC_URL}/application-reports/{DOCUMENT_PRODUCT_CODE}/'
+        mock.post(re.compile(f"{post_url}.*"),
+                  status_code=HTTPStatus.CREATED,
+                  text=json.dumps(mock_response))
+        get_url = f'{DOCUMENT_SVC_URL}/application-reports/{DOCUMENT_PRODUCT_CODE}/'
+        mock.get(re.compile(f"{get_url}.*"),
+                 status_code=HTTPStatus.OK,
+                 text=json.dumps(mock_response))
+        get_url2 = f'{DOCUMENT_SVC_URL}/application-reports/history/{DOCUMENT_PRODUCT_CODE}/'
+        mock.get(re.compile(f"{get_url2}.*"),
+                 status_code=HTTPStatus.OK,
+                 text=json.dumps(mock_response))
+        yield mock
+
+
+@pytest.fixture()
+def mock_drs_service():
+    mock_response = []
+    with requests_mock.Mocker(real_http=True) as m:
+        get_url = f'{DOCUMENT_SVC_URL}/application-reports/{DOCUMENT_PRODUCT_CODE}/'
+        get_url2 = f'{DOCUMENT_SVC_URL}/application-reports/history/{DOCUMENT_PRODUCT_CODE}/'
+        get_url3 = f'{DOCUMENT_SVC_URL}/application-reports/events/{DOCUMENT_PRODUCT_CODE}/'
+        m.register_uri('GET', re.compile(f"{get_url}.*"), json=mock_response, status_code=HTTPStatus.OK)
+        m.register_uri('GET', re.compile(f"{get_url2}.*"), json=mock_response, status_code=HTTPStatus.OK)
+        m.register_uri('GET', re.compile(f"{get_url3}.*"), json=mock_response, status_code=HTTPStatus.OK)
+        yield m

@@ -1,0 +1,28 @@
+<div class="no-page-break">
+    {% if listOfTranslations|length or previousNameTranslations|length %}
+        <div class="separator mt-4"></div>
+        {% if reportType == 'summary' %}
+            <div class="section-sub-title mt-4">Translation(s) of Company Name:</div>
+        {% else %}
+            <div class="section-title mt-4">Company Name Translation(s)
+            {% if header.name == 'correction' %}
+                <span class="section-sub-title">{{ labelCorrected() }}</span>
+            {% endif %}
+            </div>
+        {% endif %}
+        <div class="section-data mt-3">
+            <table class="section-translation-table" role="presentation">
+                {% if listOfTranslations|length == 0 and previousNameTranslations|length %}
+                    <div class="mt-2">NONE</div>
+                {% else %}
+                    {% for translation in listOfTranslations %}
+                        <tr>
+                            <td><div class="upper-text">{{translation.name}}</div></td>
+                        </tr>
+                    {% endfor %}
+                {% endif %}
+            </table>
+        </div>   
+    {% endif %} 
+</div>
+

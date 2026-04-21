@@ -1,0 +1,1578 @@
+# Copyright © 2019 Province of British Columbia
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Common validations share through the different filings."""
+import io
+import re
+from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from typing import Final, Optional
+
+import pycountry
+from flask import current_app, g, request
+from flask_babel import _
+from pypdf import PdfReader
+
+from legal_api.core.filing import Filing as CoreFiling
+from legal_api.errors import Error
+from legal_api.models import Address, Business, PartyRole
+from legal_api.models.configuration import EMAIL_PATTERN
+from legal_api.services import MinioService, colin, flags, namex
+from legal_api.services.bootstrap import AccountService
+from legal_api.services.permissions import ListActionsPermissionsAllowed, PermissionService
+from legal_api.services.request_context import get_request_context
+from legal_api.services.utils import get_str
+from legal_api.utils.datetime import date
+from legal_api.utils.datetime import datetime as dt
+from legal_api.utils.legislation_datetime import LegislationDatetime
+
+NO_POSTAL_CODE_COUNTRY_CODES = {
+    "AO", "AG", "AW", "BS", "BZ", "BJ", "BM", "BO", "BQ", "BW", "BF", "BI",
+    "CM", "CF", "TD", "KM", "CG", "CD", "CK", "CI", "CW", "DJ", "DM", "GQ",
+    "ER", "FJ", "TF", "GA", "GM", "GH", "GD", "GY", "HM", "HK",
+    "KI", "KP", "LY", "MO", "MW", "ML", "MR", "NR",
+    "AN", "NU", "QA", "RW", "KN", "ST", "SC", "SL", "SX", "SB", "SO", "SR", "SY",
+    "TL", "TG", "TK", "TO", "TT", "TV", "UG", "AE", "VU", "YE", "ZW"
+}
+
+WHITESPACE_VALIDATED_ADDRESS_FIELDS = (
+    "streetAddress",
+    "addressCity",
+    "addressCountry",
+    "postalCode",
+)
+
+CANADIAN_POSTAL_CODE_REGEX = re.compile(
+    r"^[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z] ?\d[ABCEGHJ-NPRSTV-Z]\d$",
+    re.IGNORECASE
+)
+
+PARTY_NAME_MAX_LENGTH = 30
+
+# Share structure constants
+EXCLUDED_WORDS_FOR_CLASS = ["share", "shares", "value"]
+EXCLUDED_WORDS_FOR_SERIES = ["share", "shares"]
+SHARE_NAME_SUFFIX = " Shares"
+MAX_SHARE_DIGITS = 16
+
+# Note:
+# - Corrections are handled separately (CLIENT only)
+# - Dissolution is handled separately (voluntary only)
+FILINGS_REQUIRING_CERTIFICATION = {
+    CoreFiling.FilingTypes.ANNUALREPORT,
+    CoreFiling.FilingTypes.CHANGEOFADDRESS,
+    CoreFiling.FilingTypes.CHANGEOFDIRECTORS,
+    CoreFiling.FilingTypes.CHANGEOFREGISTRATION,
+    CoreFiling.FilingTypes.NOTICEOFWITHDRAWAL,
+    CoreFiling.FilingTypes.REGISTRATION,
+    CoreFiling.FilingTypes.SPECIALRESOLUTION,
+}
+
+def validate_resolution_date_in_share_structure(filing_json, filing_type, business) -> list[dict]:
+    """Validate the resolution date of a share structure.
+
+    Rules:
+    - If hasRightsOrRestrictions is true in any share class or series, resolution date is required.
+    - Only one resolution date is permitted.
+    - Resolution date cannot be in the future.
+    - Resolution date cannot be before the business founding date.
+    """
+    share_structure = filing_json["filing"][filing_type].get("shareStructure", {})
+    share_classes = share_structure.get("shareClasses", [])
+    resolution_dates = share_structure.get("resolutionDates", [])
+
+    err_path = f"/filing/{filing_type}/shareStructure/resolutionDates"
+        
+    msg = []
+    if (
+        (
+            any(x.get("hasRightsOrRestrictions", False) for x in share_classes) or
+            any(has_rights_or_restrictions_true_in_share_series(x) for x in share_classes)
+        ) and
+        len(resolution_dates) == 0
+    ):
+        msg.append({
+            "error": "Resolution date is required when hasRightsOrRestrictions is true.",
+            "path": err_path
+        })
+
+    if len(resolution_dates) > 1:
+        msg.append({
+            "error": "Only one resolution date is permitted.",
+            "path": err_path
+        })
+
+    elif len(resolution_dates) == 1:
+        resolution_date_leg = date.fromisoformat(resolution_dates[0])
+        founding_date_leg = LegislationDatetime.as_legislation_timezone(business.founding_date).date()
+        today_leg = LegislationDatetime.datenow()
+
+        if resolution_date_leg > today_leg:
+            msg.append({
+                "error": "Resolution date cannot be in the future.",
+                "path": err_path
+            })
+
+        if resolution_date_leg < founding_date_leg:
+            msg.append({
+                "error": "Resolution date cannot be before the business founding date.",
+                "path": err_path
+            })
+
+    return msg
+
+
+def has_rights_or_restrictions_true_in_share_series(share_class) -> bool:
+    """Has hasRightsOrRestrictions is true in series."""
+    series = share_class.get("series", [])
+    return any(x.get("hasRightsOrRestrictions", False) for x in series)
+
+
+def validate_share_structure(incorporation_json, filing_type, legal_type) -> Error:  # pylint: disable=too-many-branches
+    """Validate the share structure data of the incorporation filing."""
+    share_classes = incorporation_json["filing"][filing_type] \
+        .get("shareStructure", {}).get("shareClasses", [])
+    msg = []
+    memoize_names = []
+
+    # For incorporation applications, at least one share class is required, for Alteration can not include if not changing
+    if filing_type == CoreFiling.FilingTypes.INCORPORATIONAPPLICATION.value and len(share_classes) == 0:
+        msg.append({
+            "error": "A company must have at least one Class of Shares.",
+            "path": f"/filing/{filing_type}/shareStructure/shareClasses"
+        })
+        return msg
+
+    for index, item in enumerate(share_classes):
+        shares_msg = validate_shares(item, memoize_names, filing_type, index, legal_type)
+        if shares_msg:
+            msg.extend(shares_msg)
+
+    if msg:
+        return msg
+
+    return None
+
+
+def _series_name_has_reserved_words(series_name: str) -> bool:
+    """Check if the series name contains reserved words (excluding the required suffix)."""
+    suffix_len = len(SHARE_NAME_SUFFIX)
+    name_without_suffix = series_name[:-suffix_len] if series_name.endswith(SHARE_NAME_SUFFIX) else series_name
+    series_name_words = name_without_suffix.lower().split()
+    return any(word in EXCLUDED_WORDS_FOR_SERIES for word in series_name_words)
+
+
+def validate_series(item, memoize_names, filing_type, index) -> Error: # noqa: PLR0912
+    """Validate shareStructure includes a wellformed series."""
+    msg = []
+    for series_index, series in enumerate(item.get("series", [])):
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/series/{series_index}"
+
+        series_name = series.get("name", "")
+        stripped_series_name = series_name.strip()
+
+        if not stripped_series_name:
+            msg.append({
+                "error": "Share series name is required.",
+                "path": f"{err_path}/name/"
+            })
+
+        elif series_name != stripped_series_name:
+            msg.append({
+                "error": "Share series name cannot start or end with whitespace.",
+                "path": f"{err_path}/name/"
+            })
+        
+        elif not series_name.endswith(SHARE_NAME_SUFFIX):
+            msg.append({
+                "error": f"Share series name '{series_name}' must end with '{SHARE_NAME_SUFFIX}'.",
+                "path": f"{err_path}/name/"
+            })
+        
+        elif _series_name_has_reserved_words(series_name):
+            msg.append({
+                "error": "Share series name cannot contain the words 'share' or 'shares'.",
+                "path": f"{err_path}/name/"
+            })
+
+        elif series_name in memoize_names:
+            msg.append({"error": f"Share series {series_name} name already used in a share class or series.",
+                        "path": err_path})
+        else:
+            memoize_names.append(series_name)
+
+
+        if series["hasMaximumShares"]:
+            max_shares = series.get("maxNumberOfShares", None)
+            if max_shares is None:
+                msg.append({
+                    "error": f"Share series {series['name']} must provide value for maximum number of shares",
+                    "path": f"{err_path}/maxNumberOfShares"
+                })
+            elif not (isinstance(max_shares, int) and not isinstance(max_shares, bool)):
+                msg.append({
+                    "error": "Must be a whole number",
+                    "path": f"{err_path}/maxNumberOfShares"
+                })
+            elif max_shares <= 0:
+                msg.append({
+                    "error": "Number must be greater than 0",
+                    "path": f"{err_path}/maxNumberOfShares"
+                })
+            elif len(str(abs(max_shares))) >= MAX_SHARE_DIGITS:
+                msg.append({
+                    "error": "Number must be less than 16 digits",
+                    "path": f"{err_path}/maxNumberOfShares"
+                })
+            # Check series shares do not exceed class shares
+            elif (
+                item["hasMaximumShares"]
+                and item.get("maxNumberOfShares", None)
+                and isinstance(item["maxNumberOfShares"], int)
+                and not isinstance(item["maxNumberOfShares"], bool)
+                and max_shares > item["maxNumberOfShares"]
+            ):
+                msg.append({
+                    "error": f"Series {series['name']} share quantity must be less than or equal to that of its class {item['name']}",
+                    "path": f"{err_path}/maxNumberOfShares"
+                })
+    return msg
+
+
+def _class_name_has_reserved_words(share_name: str) -> bool:
+    # Validate share class name does not contain reserved words (excluding the required suffix)
+    # Remove the suffix before checking for reserved words
+    suffix_len = len(SHARE_NAME_SUFFIX)
+    name_without_suffix = share_name[:-suffix_len] if share_name.endswith(SHARE_NAME_SUFFIX) else share_name
+    name_words = name_without_suffix.lower().split()
+    return any(word in EXCLUDED_WORDS_FOR_CLASS for word in name_words)
+
+
+def validate_shares(item, memoize_names, filing_type, index, legal_type) -> Error: # noqa: PLR0912
+    """Validate a wellformed share structure."""
+    msg = []
+
+    share_name = item.get("name", "")
+    stripped_share_name = share_name.strip()
+
+    if not stripped_share_name:
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/name/"
+        msg.append({
+            "error": "Share class name is required.",
+            "path": err_path
+        })
+
+    elif share_name != stripped_share_name:
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/name/"
+        msg.append({
+            "error": "Share class name cannot start or end with whitespace.",
+            "path": err_path
+        })
+    
+    elif not share_name.endswith(SHARE_NAME_SUFFIX):
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/name/"
+        msg.append({
+            "error": f"Share class name '{share_name}' must end with '{SHARE_NAME_SUFFIX}'.",
+            "path": err_path
+        })
+    
+    elif _class_name_has_reserved_words(share_name):
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/name/"
+        msg.append({
+            "error": "Share class name cannot contain the words 'share', 'shares', or 'value'.",
+            "path": err_path
+        })
+
+    elif share_name in memoize_names:
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/name/"
+        msg.append({"error": f"Share class {share_name} name already used in a share class or series.",
+                    "path": err_path})
+    else:
+        memoize_names.append(share_name)
+
+    if item["hasMaximumShares"]:
+        max_shares = item.get("maxNumberOfShares", None)
+        err_path = f"/filing/{filing_type}/shareClasses/{index}/maxNumberOfShares/"
+        if max_shares is None:
+            msg.append({
+                "error": f"Share class {item['name']} must provide value for maximum number of shares",
+                "path": err_path
+            })
+        elif not (isinstance(max_shares, int) and not isinstance(max_shares, bool)):
+            msg.append({
+                "error": "Must be a whole number",
+                "path": err_path
+            })
+        elif max_shares <= 0:
+            msg.append({
+                "error": "Number must be greater than 0",
+                "path": err_path
+            })
+        elif len(str(abs(max_shares))) >= MAX_SHARE_DIGITS:
+            msg.append({
+                "error": "Number must be less than 16 digits",
+                "path": err_path
+            })
+    if item["hasParValue"]:
+        if not item.get("parValue", None):
+            err_path = f"/filing/{filing_type}/shareClasses/{index}/parValue/"
+            msg.append({"error": "Share class {} must specify par value".format(item["name"]), "path": err_path})
+        if not item.get("currency", None):
+            err_path = f"/filing/{filing_type}/shareClasses/{index}/currency/"
+            msg.append({"error": "Share class {} must specify currency".format(item["name"]), "path": err_path})
+
+    # Validate that corps type companies cannot have series in share classes when hasRightsOrRestrictions is false
+    if legal_type in Business.CORPS:
+        series = item.get("series", [])
+        has_series = False
+        if len(series) > 0:
+            has_series = True
+
+        if not item.get("hasRightsOrRestrictions", False) and has_series:
+            err_path = f"/filing/{filing_type}/shareClasses/{index}/series/"
+            msg.append({
+                "error": "Share class {} cannot have series when hasRightsOrRestrictions is false".format(item["name"]),
+                "path": err_path
+            })
+            return msg
+
+    series_msg = validate_series(item, memoize_names, filing_type, index)
+    if series_msg:
+        msg.extend(series_msg)
+
+    return msg
+
+
+def _is_valid_currency(code: str) -> bool:
+    """Check if the currency code is a recognized ISO 4217 code."""
+    return pycountry.currencies.get(alpha_3=code) is not None
+
+
+def _get_grandfathered_other_classes(business):
+    """Get lookup of existing share classes with currency OTHER and their series IDs."""
+    existing_other_classes = {}
+    if not business:
+        return existing_other_classes
+    for sc in business.share_classes:
+        if sc.currency and sc.currency.upper() == "OTHER":
+            existing_other_classes[sc.id] = {s.id for s in sc.series}
+    return existing_other_classes
+
+
+def _validate_grandfathered_other_series(item, existing_series_ids, err_path):
+    """Block new series added under a grandfathered OTHER share class."""
+    msg = []
+    for series_index, series in enumerate(item.get("series", [])):
+        if series.get("id", None) not in existing_series_ids:
+            msg.append({
+                "error": "Cannot add new series under a share class with currency type OTHER.",
+                "path": f"{err_path}/series/{series_index}"
+            })
+    return msg
+
+
+def validate_share_currency(filing_json, filing_type, business=None):
+    """Validate share class currency codes are valid ISO 4217 codes.
+
+    Only validates share classes where hasParValue is true (currency is only
+    required/meaningful when par value is set).
+
+    Existing share classes with currency OTHER are allowed to pass through unchanged
+    when a business is provided and the incoming share class ID matches an existing
+    OTHER share class in the DB. New series under those classes are blocked.
+    """
+    share_classes = filing_json["filing"][filing_type] \
+        .get("shareStructure", {}).get("shareClasses", [])
+    msg = []
+    existing_other_classes = _get_grandfathered_other_classes(business)
+
+    for index, item in enumerate(share_classes):
+        if not item.get("hasParValue", False):
+            continue
+
+        currency = item.get("currency", None)
+        if not currency:
+            continue  # presence check handled by validate_shares()
+
+        err_path = f"/filing/{filing_type}/shareClasses/{index}"
+
+        # Allow grandfathered OTHER share classes to pass through
+        if currency.upper() == "OTHER":
+            share_class_id = item.get("id", None)
+            if share_class_id and share_class_id in existing_other_classes:
+                msg.extend(_validate_grandfathered_other_series(
+                    item, existing_other_classes[share_class_id], err_path))
+                continue
+
+        # Reject invalid currency codes (includes OTHER on new/unmatched share classes)
+        if not _is_valid_currency(currency):
+            msg.append({
+                "error": f"Invalid currency for share class {item.get('name', '')}. "
+                         f"Currency must be a valid ISO 4217 code.",
+                "path": f"{err_path}/currency/"
+            })
+
+    return msg
+
+
+def validate_court_order(court_order_path, court_order):
+    """Validate the courtOrder data of the filing."""
+    msg = []
+
+    # TODO remove it when the issue with schema validation is fixed
+    min_file_number_length: Final = 5
+    max_file_number_length: Final = 20
+    if "fileNumber" not in court_order:
+        err_path = court_order_path + "/fileNumber"
+        msg.append({"error": "Court order file number is required.", "path": err_path})
+    elif (
+        len(court_order["fileNumber"]) < min_file_number_length or
+        len(court_order["fileNumber"]) > max_file_number_length
+    ):
+        err_path = court_order_path + "/fileNumber"
+        msg.append({"error": "Length of court order file number must be from 5 to 20 characters.",
+                    "path": err_path})
+
+    if (effect_of_order := court_order.get("effectOfOrder", None)) and effect_of_order != "planOfArrangement":
+        msg.append({"error": "Invalid effectOfOrder.", "path": f"{court_order_path}/effectOfOrder"})
+
+    court_order_date_path = court_order_path + "/orderDate"
+    if "orderDate" in court_order:
+        try:
+            court_order_date = dt.fromisoformat(court_order["orderDate"])
+            if court_order_date.timestamp() > datetime.utcnow().timestamp():
+                err_path = court_order_date_path
+                msg.append({"error": "Court order date cannot be in the future.", "path": err_path})
+        except ValueError:
+            err_path = court_order_date_path
+            msg.append({"error": "Invalid court order date format.", "path": err_path})
+            
+    if flags.is_on("enabled-deeper-permission-action"):
+        required_permission = ListActionsPermissionsAllowed.COURT_ORDER_POA.value
+        message = "Permission Denied - You do not have permissions add court order details in this filing."
+        permission_error = PermissionService.check_user_permission(required_permission, message=message)
+        if permission_error:
+            msg.append({"error": permission_error.msg[0].get("message", message), "path": court_order_path})
+    if msg:
+        return msg
+
+    return None
+
+def check_good_standing_permission(business: Business) -> Optional[Error]:
+    """Check if user has permission to file for a business not in good standing."""
+    if business.good_standing:
+        return None
+    
+    if not flags.is_on("enabled-deeper-permission-action"):
+        return None
+    
+    required_permission = ListActionsPermissionsAllowed.OVERRIDE_NIGS.value
+    message = "Permission Denied - You do not have permissions send not in good standing business in this filing."
+    return PermissionService.check_user_permission(required_permission, message=message)
+
+def validate_pdf(file_key: str, file_key_path: str, verify_paper_size: bool = True) -> Optional[list]:
+    """Validate the PDF file."""
+    msg = []
+    try:
+        file = MinioService.get_file(file_key)
+        open_pdf_file = io.BytesIO(file.data)
+        pdf_reader = PdfReader(open_pdf_file)
+
+        # Check that all pages in the pdf are letter size and able to be processed.
+        width: Final = 612  # 8.5 inches
+        height: Final = 792  # 11 inches
+        if (
+            verify_paper_size and
+            any(x.mediabox.width != width or x.mediabox.height != height for x in pdf_reader.pages)
+        ):
+            msg.append({"error": _("Document must be set to fit onto 8.5” x 11” letter-size paper."),
+                        "path": file_key_path})
+
+        file_info = MinioService.get_file_info(file_key)
+        max_file_size: Final = 30000000
+        if file_info.size > max_file_size:
+            msg.append({"error": _("File exceeds maximum size."), "path": file_key_path})
+
+        if pdf_reader.is_encrypted:
+            msg.append({"error": _("File must be unencrypted."), "path": file_key_path})
+
+    except Exception as ex:
+        current_app.logger.debug(f"Error validating PDF: {ex}")
+        msg.append({"error": _("Invalid file."), "path": file_key_path})
+
+    if msg:
+        return msg
+
+    return None
+
+
+def validate_parties_names(filing_json: dict, filing_type: str, legal_type: str) -> list:
+    """Validate the parties name for COLIN sync."""
+    # FUTURE: This validation should be removed when COLIN sync back is no longer required.
+    # This is required to work around first and middle name length mismatches between LEAR and COLIN.
+    # Syncing back to COLIN would error out on first and middle name length exceeding 20 characters for party
+    msg = []
+    parties_array = filing_json["filing"][filing_type]["parties"]
+    party_path = f"/filing/{filing_type}/parties"
+
+    for item in parties_array:
+        msg.extend(validate_party_name(item, party_path, legal_type))
+
+    return msg
+
+
+def validate_party_name(party: dict, party_path: str, legal_type: str) -> list: # noqa: PLR0912, PLR0915
+    """Validate party name."""
+    msg = []
+
+    custom_allowed_max_length = 20
+    last_name_max_length = PARTY_NAME_MAX_LENGTH
+    officer = party["officer"]
+    party_type = officer["partyType"]
+    party_roles = [x.get("roleType") for x in party["roles"]]
+    party_roles_str = ", ".join(party_roles)
+    organization_name = officer.get("organizationName", None)
+
+    if party_type == "person":
+
+        first_name = officer.get("firstName", None)
+        stripped_first_name = first_name.strip()
+        if (legal_type in Business.CORPS) and (not stripped_first_name):
+            msg.append({"error": f"{party_roles_str} first name is required", "path": f"{party_path}"})
+        elif first_name != stripped_first_name:
+            msg.append({
+                "error": f"{party_roles_str} first name cannot start or end with whitespace",
+                "path": party_path
+            })
+        elif len(first_name) > custom_allowed_max_length:
+            err_msg = f"{party_roles_str} first name cannot be longer than {custom_allowed_max_length} characters"
+            msg.append({"error": err_msg, "path": party_path})
+
+        middle_initial = officer.get("middleInitial", None)
+        # Only validate middle initial if it exists and contains non-whitespace characters
+        if middle_initial is not None and middle_initial.strip():
+            if middle_initial != middle_initial.strip():
+                msg.append({"error": f"{party_roles_str} middle initial cannot start or end with whitespace",
+                             "path": party_path})
+            elif len(middle_initial) > custom_allowed_max_length:
+                err_msg = f"{party_roles_str} middle initial cannot be longer than {custom_allowed_max_length} characters"
+                msg.append({"error": err_msg, "path": party_path})
+
+        middle_name = officer.get("middleName", None)
+        # Only validate middle name if it exists and contains non-whitespace characters
+        if middle_name is not None and middle_name.strip():
+            if middle_name != middle_name.strip():
+                msg.append({"error": f"{party_roles_str} middle name cannot start or end with whitespace",
+                             "path": party_path})
+            elif len(middle_name) > custom_allowed_max_length:
+                err_msg = f"{party_roles_str} middle name cannot be longer than {custom_allowed_max_length} characters"
+                msg.append({"error": err_msg, "path": party_path})
+
+        last_name = officer.get("lastName", None)
+        stripped_last_name = last_name.strip()
+        if (legal_type in Business.CORPS) and (not stripped_last_name):
+            msg.append({"error": f"{party_roles_str} last name is required", "path": f"{party_path}"})
+        elif last_name != stripped_last_name:
+            msg.append({
+                "error": f"{party_roles_str} last name cannot start or end with whitespace",
+                "path": party_path
+            })
+        elif len(last_name) > last_name_max_length:
+            err_msg = f"{party_roles_str} last name cannot be longer than {last_name_max_length} characters"
+            msg.append({"error": err_msg, "path": party_path})
+        
+        if organization_name:
+            err_msg = f"{party_roles_str} organization name should not be set for person party type"
+            msg.append({"error": err_msg, "path": party_path})
+    elif party_type == "organization":
+        if organization_name is None:
+            err_msg = "organization name is required"
+            msg.append({"error": err_msg, "path": party_path})
+        else:
+            stripped = organization_name.strip()
+            if not stripped:
+                err_msg = "organization name is required"
+                msg.append({"error": err_msg, "path": party_path})
+            elif organization_name != stripped:
+                err_msg = f"{party_roles_str} organization name cannot start or end with whitespace"
+                msg.append({"error": err_msg, "path": party_path})
+        
+        if officer.get("firstName") not in (None, ""):
+            err_msg = f"{party_roles_str} first name should not be set for organization party type"
+            msg.append({"error": err_msg, "path": party_path})
+        if officer.get("middleInitial") not in (None, ""):
+            err_msg = f"{party_roles_str} middle initial should not be set for organization party type"
+            msg.append({"error": err_msg, "path": party_path})
+        if officer.get("middleName") not in (None, ""):
+            err_msg = f"{party_roles_str} middle name should not be set for organization party type"
+            msg.append({"error": err_msg, "path": party_path})
+        if officer.get("lastName") not in (None, ""):
+            err_msg = f"{party_roles_str} last name should not be set for organization party type"
+            msg.append({"error": err_msg, "path": party_path})
+        
+    return msg
+
+
+def validate_relationships( # noqa: PLR0913
+    business: Business,
+    filing_json: dict,
+    filing_type: str,
+    role_types: list[PartyRole.RoleTypes],
+    allow_new: bool,
+    allow_edits: bool,
+    role_types_for_colin_sync: Optional[list[PartyRole.RoleTypes]] = None
+) -> list:
+    """Validate the relationships information."""
+    msg = []
+    relationships = filing_json["filing"][filing_type]["relationships"]
+    party_path = f"/filing/{filing_type}/relationships"
+
+    # get relevant parties for the business
+    today = datetime.now(tz=timezone.utc).date()
+    party_roles: list[PartyRole] = []
+    for role_type in role_types:
+        if roles := PartyRole.get_party_roles(business.id, today, role_type.value):
+            party_roles.extend(roles)
+
+    party_ids = [str(party_role.party_id) for party_role in party_roles]
+
+    # Check if party is a valid party of the given role
+    for index, relationship in enumerate(relationships):
+        path = f"{party_path}/{index}"
+        identifier = relationship.get("entity", {}).get("identifier")
+        if identifier and not allow_edits:
+            msg.append({"error": "Relationship edits are not allowed in this filing.", "path": f"{path}/entity"})
+        elif identifier and identifier not in party_ids:
+            msg.append({"error": "Relationship with this identifier is not valid for this filing.", "path": f"{path}/entity/identifier"})
+        elif not identifier and not allow_new:
+            msg.append({"error": "New Relationships are not allowed in this filing.", "path": f"{path}/entity"})
+
+        msg.extend(validate_relationship_entity_name(relationship, path))
+        msg.extend(validate_relationship_roles(relationship["roles"], role_types, path))
+        
+        # Below is for colin sync checking only (i.e. any relationship with Director roles)
+        converted_sync_roles = [role.value.lower().replace(" ", "_") for role in role_types_for_colin_sync or []]
+        if any(role for role in relationship["roles"] if role["roleType"].lower() in converted_sync_roles):
+            validate_relationship_entity_colin_sync(relationship, business.legal_type, f"{path}/entity")
+
+    msg.extend(validate_parties_addresses(filing_json, filing_type, "relationships"))
+    return msg
+
+
+def _get_relationship_entity_values(party: dict) -> tuple[str, str, str, str, str, str]:
+    """Return the expected mapped entity values."""
+    entity: dict[str, str] = party["entity"]
+    organization_name = entity.get("businessName") or ""
+    given_name = entity.get("givenName") or ""
+    family_name = entity.get("familyName") or ""
+    middle_initial = entity.get("middleInitial") or ""
+    party_type = "person" if family_name else "organization"
+    party_roles = [x.get("roleType") for x in party["roles"]]
+    party_roles_str = ", ".join(party_roles)
+    return organization_name, given_name, family_name, middle_initial, party_type, party_roles_str
+
+
+def validate_relationship_entity_name(party: dict, path: str) -> list:
+    """Validate relationship entity name."""
+    msg = []
+    organization_name, given_name, family_name, middle_initial, party_type, party_roles_str = _get_relationship_entity_values(party)
+    entity = party["entity"]
+    if party_type == "person":
+        # Only familyName is required
+        if not family_name or not family_name.strip():
+            msg.append({"error": f"{party_roles_str} familyName is required", "path": f"{path}/entity/familyName"})
+
+        if organization_name:
+            err_msg = f"{party_roles_str} businessName should not be set for a person relationship entity"
+            msg.append({"error": err_msg, "path": f"{path}/entity/businessName"})
+        
+        if entity.get("businessIdentifier"):
+            err_msg = f"{party_roles_str} businessIdentifier should not be set for a person relationship entity"
+            msg.append({"error": err_msg, "path": f"{path}/entity/businessIdentifier"})
+
+    elif party_type == "organization":
+        if not organization_name or not organization_name.strip():
+            msg.append({"error": f"{party_roles_str} businessName is required", "path": f"{path}/entity/businessName"})
+        
+        if given_name not in (None, ""):
+            err_msg = f"{party_roles_str} givenName should not be set for an organization relationship entity"
+            msg.append({"error": err_msg, "path": f"{path}/entity/givenName"})
+
+        if middle_initial not in (None, ""):
+            err_msg = f"{party_roles_str} middleInitial should not be set for an organization relationship entity"
+            msg.append({"error": err_msg, "path": f"{path}/entity/middleInitial"})
+
+        if entity.get("alternateName") not in (None, ""):
+            err_msg = f"{party_roles_str} alternateName should not be set for an organization relationship entity"
+            msg.append({"error": err_msg, "path": f"{path}/entity/alternateName"})
+    
+        if entity.get("fullName") not in (None, ""):
+            err_msg = f"{party_roles_str} fullName should not be set for an organization relationship entity"
+            msg.append({"error": err_msg, "path": f"{path}/entity/fullName"})
+
+    return msg
+
+
+def _validate_relationship_entity_person_colin_sync(relationship: dict, legal_type: str, entity_path: str, custom_max_length: int, family_name_max_length: int):
+    """Validate the relationship entity name for a person for the COLIN sync."""
+    msg = []
+    _, given_name, family_name, middle_initial, _, party_roles_str = _get_relationship_entity_values(relationship)
+    stripped_given_name = given_name.strip()
+    if (legal_type in Business.CORPS) and (not stripped_given_name):
+        msg.append({"error": f"{party_roles_str} giveName is required", "path": f"{entity_path}/givenName"})
+    elif given_name != stripped_given_name:
+        msg.append({
+            "error": f"{party_roles_str} giveName cannot start or end with whitespace",
+            "path": f"{entity_path}/givenName"
+        })
+    elif len(given_name) > custom_max_length:
+        err_msg = f"{party_roles_str} given name cannot be longer than {custom_max_length} characters"
+        msg.append({"error": err_msg, "path": f"{entity_path}/givenName"})
+
+    stripped_middle_initial = middle_initial.strip()
+    if middle_initial is not None and stripped_middle_initial:
+        if middle_initial != stripped_middle_initial:
+            msg.append({"error": f"{party_roles_str} middleInitial cannot start or end with whitespace",
+                        "path": f"{entity_path}/middleInitial"})
+        elif len(middle_initial) > custom_max_length:
+            err_msg = f"{party_roles_str} middleInitial cannot be longer than {custom_max_length} characters"
+            msg.append({"error": err_msg, "path": f"{entity_path}/middleInitial"})
+
+    stripped_family_name = family_name.strip()
+    if (legal_type in Business.CORPS) and (not stripped_family_name):
+        msg.append({"error": f"{party_roles_str} familyName is required", "path": f"{entity_path}/familyName"})
+    elif family_name != stripped_family_name:
+        msg.append({
+            "error": f"{party_roles_str} familyName cannot start or end with whitespace",
+            "path": f"{entity_path}/familyName"
+        })
+    elif len(family_name) > family_name_max_length:
+        err_msg = f"{party_roles_str} family name cannot be longer than {family_name_max_length} characters"
+        msg.append({"error": err_msg, "path": f"{entity_path}/familyName"})
+
+    return msg
+
+
+def _validate_relationship_entity_org_colin_sync(relationship: dict, entity_path: str, max_length: int):
+    """Validate the relationship entity name for an organization for the COLIN sync."""
+    msg = []
+    organization_name, _, _, _, _, party_roles_str = _get_relationship_entity_values(relationship)
+    stripped = organization_name.strip()
+    if organization_name != stripped:
+        err_msg = f"{party_roles_str} businessName cannot start or end with whitespace"
+        msg.append({"error": err_msg, "path": f"{entity_path}/businessName"})
+    elif len(organization_name) > max_length:
+        err_msg = f"{party_roles_str} businessName cannot be longer than {max_length} characters"
+        msg.append({"error": err_msg, "path": f"{entity_path}/businessName"})
+
+    return msg
+
+
+def validate_relationship_entity_colin_sync(relationship: dict, legal_type: str, path: str) -> list:
+    """Validate the relationship entity name for COLIN sync."""
+    # FUTURE: This validation should be removed when COLIN sync is no longer required.
+    msg = []
+
+    custom_allowed_max_length = 20
+    family_name_max_length = PARTY_NAME_MAX_LENGTH
+
+    _, _, _, _, party_type, _ = _get_relationship_entity_values(relationship)
+
+    if party_type == "person":
+        msg.extend(_validate_relationship_entity_person_colin_sync(relationship, legal_type, path, custom_allowed_max_length, family_name_max_length))
+
+    elif party_type == "organization":
+        msg.extend(_validate_relationship_entity_org_colin_sync(relationship, path, family_name_max_length))
+
+    return msg
+
+
+def validate_relationship_roles(roles: list[dict[str, str]],
+                                allowed_roles: list[PartyRole.RoleTypes],
+                                path: str) -> list:
+    """Validate relationship roles."""
+    msg = []
+    converted_allowed_roles = [role.value.lower().replace(" ", "_") for role in allowed_roles]
+    for index, role in enumerate(roles):
+        if role.get("roleType").lower() not in converted_allowed_roles:
+            err_msg = "Invalid role type for this filing."
+            msg.append({"error": err_msg, "path": f"{path}/{index}/roleType"})
+        # FUTURE: appointment/cessation date checks (currently set to filing effective date by filer)
+
+    return msg
+
+
+def validate_name_request(filing_json: dict,  # pylint: disable=too-many-locals
+                          legal_type: str,
+                          filing_type: str,
+                          accepted_request_types: Optional[list] = None) -> list:
+    """Validate name request section."""
+    nr_path = f"/filing/{filing_type}/nameRequest"
+    nr_number_path = f"{nr_path}/nrNumber"
+    legal_name_path = f"{nr_path}/legalName"
+    legal_type_path = f"{nr_path}/legalType"
+
+    nr_number = get_str(filing_json, nr_number_path)
+    legal_name = get_str(filing_json, legal_name_path)
+
+    if not nr_number and not legal_name:
+        if legal_type in Business.CORPS:
+            return []  # It's numbered company
+        else:
+            # CP, SP, GP doesn't support numbered company
+            return [{"error": _("Legal name and nrNumber is missing in nameRequest."), "path": nr_path}]
+    elif nr_number and not legal_name:
+        return [{"error": _("Legal name is missing in nameRequest."), "path": legal_name_path}]
+    elif not nr_number and legal_name:
+        # expecting nrNumber when legalName provided
+        return [{
+            "error": _("nrNumber is missing for the legal name provided in nameRequest."),
+            "path": nr_number_path
+        }]
+
+    msg = []
+    # ensure NR is approved or conditionally approved
+    nr_response = namex.query_nr_number(nr_number)
+    nr_response_json = nr_response.json()
+    validation_result = namex.validate_nr(nr_response_json)
+    if not validation_result["is_consumable"]:
+        msg.append({"error": _("Name Request is not approved."), "path": nr_number_path})
+
+    # ensure NR request type code
+    if accepted_request_types and nr_response_json["requestTypeCd"] not in accepted_request_types:
+        msg.append({"error": _("The name type associated with the name request number entered cannot be used."),
+                    "path": nr_number_path})
+
+    # ensure business type
+    nr_legal_type = nr_response_json.get("legalType")
+    if legal_type != nr_legal_type:
+        msg.append({"error": _("Name Request legal type is not same as the business legal type."),
+                    "path": legal_type_path})
+
+    # ensure NR request has the same legal name
+    nr_name = namex.get_approved_name(nr_response_json)
+    if nr_name != legal_name:
+        msg.append({"error": _("Name Request legal name is not same as the business legal name."),
+                    "path": legal_name_path})
+
+    return msg
+
+
+def validate_foreign_jurisdiction(foreign_jurisdiction: dict,
+                                  foreign_jurisdiction_path: str,
+                                  is_region_bc_valid=False,
+                                  is_region_for_us_required=True) -> list:
+    """Validate foreign jurisdiction."""
+    msg = []
+    country_code = foreign_jurisdiction.get("country").upper()  # country is a required field in schema
+    region = (foreign_jurisdiction.get("region") or "").upper()
+
+    country = pycountry.countries.get(alpha_2=country_code)
+    if not country:
+        msg.append({"error": "Invalid country.", "path": f"{foreign_jurisdiction_path}/country"})
+    elif country_code == "CA":
+        if not is_region_bc_valid and region == "BC":
+            msg.append({"error": "Region should not be BC.", "path": f"{foreign_jurisdiction_path}/region"})
+        elif not (region == "FEDERAL" or pycountry.subdivisions.get(code=f"{country_code}-{region}")):
+            msg.append({"error": "Invalid region.", "path": f"{foreign_jurisdiction_path}/region"})
+    elif (country_code == "US" and
+          is_region_for_us_required and
+          not pycountry.subdivisions.get(code=f"{country_code}-{region}")):
+        msg.append({"error": "Invalid region.", "path": f"{foreign_jurisdiction_path}/region"})
+
+    return msg
+
+
+def validate_offices(filing_json: dict, filing_type: str, allowed_types: list[str], required_types: list[str], bc_req: bool) -> list:
+    """Validate offices."""
+    msg = []
+    offices_dict: dict = filing_json["filing"][filing_type]["offices"]
+    offices_path = f"/filing/{filing_type}/offices"
+    for key, value in offices_dict.items():
+        if key not in allowed_types:
+            msg.append({"error": f"Invalid office {key}. Only {allowed_types} are allowed.",
+                        "path": f"/filing/{filing_type}/offices"})
+        else:
+            
+            msg.extend(validate_addresses(value, f"{offices_path}/{key}", bc_req))
+
+    if missing_types := [office_type for office_type in required_types if office_type not in offices_dict]:
+        msg.append({"error": f"Missing required offices {missing_types}.",
+                    "path": f"/filing/{filing_type}/offices"})
+    return msg
+
+
+def validate_offices_addresses(filing_json: dict, filing_type: str) -> list:
+    """Validate optional fields in office addresses."""
+    # FUTURE: Update validations using this to use validate_offices instead
+    msg = []
+    offices_dict = filing_json["filing"][filing_type]["offices"]
+    offices_path = f"/filing/{filing_type}/offices"
+    for key, value in offices_dict.items():
+        msg.extend(validate_addresses(value, f"{offices_path}/{key}"))
+    return msg
+
+
+def validate_parties_addresses(filing_json: dict, filing_type: str, key: str = "parties") -> list:
+    """Validate optional fields in party addresses."""
+    msg = []
+    parties_array = filing_json["filing"][filing_type][key]
+    parties_path = f"/filing/{filing_type}/{key}"
+    for idx, party in enumerate(parties_array):
+        msg.extend(validate_addresses(party, f"{parties_path}/{idx}"))
+    return msg
+
+
+def validate_addresses(
+    addresses: dict,
+    addresses_path: str,
+    delivery_bc_req = False
+) -> list:
+    """Validate optional fields in addresses."""
+    msg = []
+    for address_type in Address.JSON_ADDRESS_TYPES:
+        if address := addresses.get(address_type):
+
+            address_type_path = f"{addresses_path}/{address_type}"
+            err = _validate_postal_code(address, address_type_path)
+            if err:
+                msg.append(err)
+
+            for field in WHITESPACE_VALIDATED_ADDRESS_FIELDS:
+                if field in address and address[field] is not None:
+                    field_value = address[field]
+                    if field_value != field_value.strip():
+                        msg.append({
+                            "error": _(f"{field} cannot start or end with whitespace."),
+                            "path": f"{address_type_path}/{field}"
+                        })
+
+            if delivery_bc_req and address_type == Address.JSON_DELIVERY:
+                region = address.get("addressRegion")
+                country = address["addressCountry"]
+
+                if region != "BC":
+                    msg.append({"error": "Address Region must be 'BC'.",
+                                "path": addresses_path})
+
+                try:
+                    country = pycountry.countries.search_fuzzy(country)[0].alpha_2
+                    if country != "CA":
+                        raise LookupError
+                except LookupError:
+                    msg.append({"error": "Address Country must be 'CA'.",
+                                "path": addresses_path})
+
+    return msg
+
+
+def _validate_postal_code(
+    address: dict,
+    address_path: str
+) -> dict:
+    """Validate postal code presence and format for the given country."""
+    country = address["addressCountry"]
+    postal_code = address.get("postalCode")
+    try:
+        country = pycountry.countries.search_fuzzy(country)[0].alpha_2
+        if country not in NO_POSTAL_CODE_COUNTRY_CODES and\
+                not postal_code:
+            return {"error": _("Postal code is required."),
+                    "path": f"{address_path}/postalCode"}
+
+        # Canadian postal code format validation
+        if country == "CA" and postal_code and not CANADIAN_POSTAL_CODE_REGEX.match(postal_code):
+            return {
+                "error": _("Postal code must follow Canadian format, e.g. 'A1A 1A1' or 'A1A1A1'."),
+                "path": f"{address_path}/postalCode"
+            }
+    except LookupError:
+        # Different ISO-2 country validations are done at filing level,
+        # this can be refactored into a common validator in the future
+        return None
+
+    return None
+
+
+def validate_phone_number(filing_json: dict, legal_type: str, filing_type: str) -> list:
+    """Validate phone number."""
+    if legal_type not in Business.CORPS:
+        return []
+
+    contact_point_path = f"/filing/{filing_type}/contactPoint"
+    contact_point_dict = filing_json["filing"][filing_type].get("contactPoint", {})
+
+    msg = []
+    if phone_num := contact_point_dict.get("phone", None):
+        # Expected format: (XXX) XXX-XXXX
+        phone_pattern = r"\(\d{3}\) \d{3}-\d{4}"
+
+        if not re.fullmatch(phone_pattern, phone_num):
+            msg.append({
+                "error": "Invalid phone number, expected format: (XXX) XXX-XXXX",
+                "path": f"{contact_point_path}/phone"
+            })
+
+    max_extension_length: Final = 5
+    if (extension := contact_point_dict.get("extension")):
+        extension_str = str(extension)
+
+        if not extension_str.isdigit() or len(extension_str) > max_extension_length:
+            msg.append({"error": "Invalid extension, maximum 5 digits", "path": f"{contact_point_path}/extension"})
+
+    return msg
+
+def validate_email(filing_json: dict, filing_type: str) -> list:
+    """Validate email address format."""
+    contact_point_path = f"/filing/{filing_type}/contactPoint"
+    contact_point_dict = filing_json["filing"][filing_type].get("contactPoint", {})
+
+    msg = []
+
+    if email := contact_point_dict.get("email", None):
+        # Validate leading/trailing whitespace
+        if email != email.strip():
+            msg.append({
+                "error": "Email cannot start or end with whitespace.",
+                "path": f"{contact_point_path}/email"
+            })
+
+        # Validate format
+        elif not re.match(EMAIL_PATTERN, email):
+            msg.append({
+                "error": "Invalid email address format.",
+                "path": f"{contact_point_path}/email"
+            })
+
+    return msg
+
+def validate_effective_date(filing_json: dict) -> list:
+    """Validate effective date"""
+    msg = []
+
+    now = dt.utcnow()
+    min_allowed = now + timedelta(minutes=2)
+    max_allowed = now + timedelta(days=10)
+
+    filing_effective_date = filing_json.get("filing", {}).get("header", {}).get("effectiveDate")
+    if not filing_effective_date:
+        return msg
+
+    try:
+        effective_date = datetime.fromisoformat(filing_effective_date)
+    except ValueError:
+        msg.append({"error": f"{filing_effective_date} is an invalid ISO format for effectiveDate.",
+                    "path": "/filing/header/effectiveDate"})
+        return msg
+
+    if effective_date < min_allowed:
+        msg.append({"error": "Invalid Datetime, effective date must be a minimum of 2 minutes ahead.",
+                    "path": "/filing/header/effectiveDate"})
+        return msg
+
+    if effective_date > max_allowed:
+        msg.append({"error": "Invalid Datetime, effective date must be a maximum of 10 days ahead.",
+                    "path": "/filing/header/effectiveDate"})
+        return msg
+
+    return msg
+
+def find_updated_keys_for_firms(business: Business, filing_json: dict, filing_type) -> list: # noqa: PLR0912
+    """Find updated keys in the firm filing (replace, add, edit email, etc.)."""
+    updated_keys = []
+    is_dba = False
+    if business.legal_type == Business.LegalTypes.SOLE_PROP.value:
+        role_type = PartyRole.RoleTypes.PROPRIETOR.value
+    elif business.legal_type == Business.LegalTypes.PARTNERSHIP.value:
+        role_type = PartyRole.RoleTypes.PARTNER.value
+    else:
+        return updated_keys
+
+    # Get business and existing parties from DB
+    db_party_roles = PartyRole.get_parties_by_role(business.id, role_type)
+    parties = filing_json["filing"][filing_type].get("parties", [])
+
+    matched_db_parties = set()
+
+    for party in parties:
+        roles = party.get("roles", [])
+        has_matching_role = any(role.get("roleType").lower() == role_type.lower() for role in roles)
+        if not has_matching_role:
+            continue
+        officer = party.get("officer", {})
+        email = officer.get("email")
+        mailing_address = party.get("mailingAddress", {})
+        delivery_address = party.get("deliveryAddress", {})
+
+        # Match with existing DB party
+        matched_db_party = None
+        party_id = party.get("officer", {}).get("id")
+
+        if party_id:
+            for role in db_party_roles:
+                if role.party_id == party_id and role.party_id not in matched_db_parties:
+                    matched_db_party = role.party
+                    if matched_db_party:
+                        matched_db_parties.add(role.party_id)
+                        break
+       
+        if matched_db_party:
+            if role_type == PartyRole.RoleTypes.PROPRIETOR.value and matched_db_party.organization_name:
+                is_dba = True
+            changes = {}
+            # Email comparison
+            if not is_same_str(email, matched_db_party.email):
+                changes["email"] = {
+                    "old": normalize_str(matched_db_party.email),
+                    "new": normalize_str(email)
+                }
+            
+            old_name = {
+                    "firstName": matched_db_party.first_name,
+                    "middleName": matched_db_party.middle_initial,
+                    "lastName": matched_db_party.last_name,
+                    "organizationName": matched_db_party.organization_name
+                }
+            new_name = {
+                "firstName": officer.get("firstName"),
+                "middleName": officer.get("middleName"),
+                "lastName": officer.get("lastName"),
+                "organizationName": officer.get("organizationName")
+            }
+          
+            name_changed = is_name_changed(old_name, new_name)
+            changes["name"] = {
+                "old": old_name,
+                "new": new_name,
+                "changed": name_changed
+            }
+            # Mailing address comparison
+            db_mailing_address = (Address.find_by_id(matched_db_party.mailing_address_id)
+                                  if matched_db_party.mailing_address_id else None)
+            old_mailing = {
+                "streetAddress": db_mailing_address.street,
+                "addressCity": db_mailing_address.city,
+                "addressRegion": db_mailing_address.region,
+                "postalCode": db_mailing_address.postal_code,
+                "addressCountry": db_mailing_address.country,
+                "deliveryInstructions": db_mailing_address.delivery_instructions,
+                "streetAddressAdditional": db_mailing_address.street_additional
+            } if db_mailing_address else {}
+            new_mailing = {
+                "streetAddress": mailing_address.get("streetAddress"),
+                "addressCity": mailing_address.get("addressCity"),
+                "addressRegion": mailing_address.get("addressRegion"),
+                "postalCode": mailing_address.get("postalCode"),
+                "addressCountry": mailing_address.get("addressCountry"),
+                "deliveryInstructions": mailing_address.get("deliveryInstructions"),
+                "streetAddressAdditional": mailing_address.get("streetAddressAdditional")
+            }
+
+            if not is_address_changed(old_mailing, new_mailing):
+                changes["address"] = {"old": old_mailing, "new": new_mailing}
+
+            # Delivery address comparison
+            db_delivery_address = (Address.find_by_id(matched_db_party.delivery_address_id)
+                                  if matched_db_party.delivery_address_id else None)
+            
+            old_delivery = {
+                "streetAddress": db_delivery_address.street,
+                "addressCity": db_delivery_address.city,
+                "addressRegion": db_delivery_address.region,
+                "postalCode": db_delivery_address.postal_code,
+                "addressCountry": db_delivery_address.country,
+                "deliveryInstructions": db_delivery_address.delivery_instructions,
+                "streetAddressAdditional": db_delivery_address.street_additional
+            } if db_delivery_address else {}
+            new_delivery = {
+                "streetAddress": delivery_address.get("streetAddress"),
+                "addressCity": delivery_address.get("addressCity"),
+                "addressRegion": delivery_address.get("addressRegion"),
+                "postalCode": delivery_address.get("postalCode"),
+                "addressCountry": delivery_address.get("addressCountry"),
+                "deliveryInstructions": delivery_address.get("deliveryInstructions"),
+                "streetAddressAdditional": delivery_address.get("streetAddressAdditional")
+            }
+
+            if not is_address_changed(old_delivery, new_delivery):
+                changes["deliveryAddress"] = {"old": old_delivery, "new": new_delivery}
+            if changes:
+                updated_keys.append({
+                    "name_changed":changes.get("name", {}).get("changed", False),
+                    "email_changed": "email" in changes,
+                    "address_changed": "address" in changes,
+                    "delivery_address_changed": "deliveryAddress" in changes,
+                    "is_dba": is_dba
+                })
+
+    return updated_keys
+
+def normalize_str(value: str) -> str:
+   """Convert None or empty values to a stripped uppercase string."""
+   return (value or "").strip().upper()
+   
+def is_same_str(str1: str, str2: str) -> bool:
+   """Check if two strings are the same after normalization."""
+   return normalize_str(str1) == normalize_str(str2)
+
+def is_name_changed(name1: dict, name2: dict) -> bool:
+   """Check if two names are different."""
+   name_keys = ["firstName", "middleName", "lastName", "organizationName"]
+   return any(not is_same_str(name1.get(key), name2.get(key)) for key in name_keys)
+
+def is_address_changed(addr1: dict, addr2: dict) -> bool:
+   """Check if two addresses are the same."""
+   keys = [
+       "streetAddress", "addressCity", "addressRegion",
+       "postalCode", "addressCountry",
+       "deliveryInstructions", "streetAddressAdditional"
+   ]
+   return all(is_same_str(addr1.get(key), addr2.get(key)) for key in keys)
+
+def check_completing_party_permission(msg: list, filing_type:str) -> Optional[Error]:
+    """Check completing party permission and append error message if not allowed."""
+    permission_error = PermissionService.check_user_permission(
+        ListActionsPermissionsAllowed.EDITABLE_COMPLETING_PARTY.value,
+        message="Permission Denied: You do not have permission to edit the completing party."
+    )
+    if permission_error:
+       return permission_error
+    return None
+
+
+def validate_staff_payment(filing_json: dict) -> bool:
+    """Check staff specific headers are in the filing."""
+    header = filing_json["filing"]["header"]
+    return bool(
+        "routingSlipNumber" in header or
+        "bcolAccountNumber" in header or
+        "datNumber" in header or
+        "waiveFees" in header or
+        "priority" in header
+    )
+
+def validate_certify_name(filing_json) -> bool:
+    """Check certify_by is modified."""
+    certify_name = filing_json["filing"]["header"].get("certifiedBy")
+    try:
+        name = g.jwt_oidc_token_info.get("name")
+        if certify_name and certify_name == name:
+            return False
+    except (AttributeError, RuntimeError) as err:
+        current_app.logger.error("No JWT present to validate certify name against.")
+        current_app.logger.error(err)
+        return True
+    return True
+
+def validate_certified_by(filing_json: dict, business: Business) -> list:
+    from legal_api.services.filings.validations.dissolution import DissolutionTypes
+    """Validate certifiedBy field."""
+    msg = []
+    certified_by = filing_json["filing"]["header"].get("certifiedBy")
+    filing_type = filing_json["filing"]["header"].get("name")
+
+    if isinstance(business, Business):
+        legal_type = business.legal_type
+    elif filing_type == CoreFiling.FilingTypes.NOTICEOFWITHDRAWAL:
+        legal_type = filing_json["filing"].get("business", None).get("legalType")
+    else:
+        legal_type = filing_json["filing"][filing_type]["nameRequest"].get("legalType")
+
+    if legal_type in Business.CORPS:
+        return msg  # certifiedBy is not required for corporations
+    is_cert_filing = filing_type in FILINGS_REQUIRING_CERTIFICATION
+
+    is_client_correction = (
+        filing_type == CoreFiling.FilingTypes.CORRECTION
+        and filing_json["filing"].get("correction", {}).get("type") == "CLIENT"
+    )
+
+    is_voluntary_dissolution = (
+        filing_type == CoreFiling.FilingTypes.DISSOLUTION
+        and filing_json["filing"].get("dissolution", {}).get("dissolutionType") == DissolutionTypes.VOLUNTARY.value
+    )
+
+    certification_required = (is_cert_filing or is_client_correction or is_voluntary_dissolution)
+
+    if certification_required:
+        if not certified_by:
+            msg.append({
+                "error": "Certified by field is required.",
+                "path": "/filing/header/certifiedBy"
+            })
+        elif certified_by.strip() and certified_by != certified_by.strip():
+            msg.append({
+                "error": "Certified by field cannot start or end with whitespace.",
+                "path": "/filing/header/certifiedBy"
+            })
+
+    return msg
+
+def validate_name_translation(filing_json: dict, filing_type: str) -> list:
+    """Validate name translations fields."""
+    msg = []
+    translations = filing_json["filing"][filing_type].get("nameTranslations", [])
+
+    for idx, translation in enumerate(translations):
+
+        name = translation.get("name")
+        stripped_name = name.strip()
+
+        if not stripped_name:
+            msg.append({
+                "error": "Name translation cannot be an empty string.",
+                "path": f"/filing/{filing_type}/nameTranslations/{idx}/name/"
+            })
+        elif name != stripped_name:
+            msg.append({
+                "error": "Name translation cannot start or end with whitespace.",
+                "path": f"/filing/{filing_type}/nameTranslations/{idx}/name/"
+            })
+
+    return msg
+
+def is_officer_proprietor_replace_valid(business: Business, filing_json: dict, filing_type) -> Optional[str]:
+    """Validate that sole proprietor is not being replaced with another sole proprietor."""
+    if business.legal_type!= Business.LegalTypes.SOLE_PROP.value:
+        # Validation only for sole proprietorships
+        return False
+    
+    # Existing proprietor in DB
+    existing_party_roles = PartyRole.get_party_roles(business.id, datetime.now(tz=timezone.utc).date(), role= PartyRole.RoleTypes.PROPRIETOR.value)
+    existing_proprietor = None
+    for role in existing_party_roles:
+        existing_proprietor = role.party
+        break
+    
+    if not existing_proprietor:
+        # No existing proprietor found, nothing to validate
+        return False
+    
+
+    parties = filing_json["filing"][filing_type].get("parties", [])
+
+    for party in parties:
+        officer_identifier = party.get("officer", {}).get("identifier")
+        roles = party.get("roles", [])
+        has_proprietor_role = any(role.get("roleType").lower() == PartyRole.RoleTypes.PROPRIETOR.value for role in roles)
+        if has_proprietor_role and officer_identifier and  existing_proprietor and existing_proprietor.identifier != officer_identifier:
+            # Proprietor is being replaced check for respective permissions
+            return True
+    return False
+
+def validate_party_role_firms(parties: list, filing_type: str) -> list:
+    """Validate party role types for firms"""
+
+    msg = []
+    for party in parties:
+        officer = party.get("officer", {})
+        party_type = officer.get("partyType", "")
+
+        if party_type == "organization":
+            business_identifier = officer.get("identifier", None)
+            business_found = False
+
+            if business_identifier:
+                business_found = Business.find_by_identifier(business_identifier) is not None
+                if not business_found:
+                    colin_business = colin.query_business(business_identifier)
+                    business_found = colin_business.status_code == HTTPStatus.OK
+
+            if business_found:
+                continue
+            
+            if err_msg := PermissionService.check_user_permission(
+                ListActionsPermissionsAllowed.FIRM_ADD_BUSINESS.value,
+                message="Permission Denied: You do not have permission to add a business or corporation which is not registered in BC."
+                ):
+                msg.append({"error": err_msg.msg[0].get("message"),
+                            "path": f"/filing/{filing_type}/parties"
+                            })
+            
+    return msg
+
+def validate_completing_party(filing_json: dict, filing_type: str, org_id: int) -> dict:
+    """Validate completing party edited."""
+    msg = []
+    parties = filing_json["filing"][filing_type].get("parties", {})
+
+    officer = None
+    mailing_address = None
+    for party in parties:
+        roles = party.get("roles", [])
+        if any(role.get("roleType").lower().replace(" ", "_") == PartyRole.RoleTypes.COMPLETING_PARTY.value.lower() for role in roles):
+            officer = party.get("officer", {})
+            mailing_address = party.get("mailingAddress", {})
+            break
+    if not officer:
+        return {
+            "error":[{
+                "error": "Completing party is required.",
+                "path": f"/filing/{filing_type}/parties"
+            }],
+            "email_changed": False,
+            "name_changed": False,
+            "address_changed": False
+        }
+    
+    filing_completing_party_mailing_address = mailing_address or {}
+    filing_firstname = officer.get("firstName")
+    filing_lastname = officer.get("lastName")
+    filing_email = officer.get("email")
+    
+    contacts_response = AccountService.get_contacts(current_app.config, org_id)
+    if contacts_response is None:
+        return {
+            "error":[{
+            "error": "Unable to verify completing party against account contacts.",
+            "path": f"/filing/{filing_type}/parties"
+        }],
+        "email_changed": False,
+        "name_changed": False,
+        "address_changed": False
+        }
+    
+    contact = contacts_response["contacts"][0]
+    existing_cp_mailing_address = {
+        "streetAddress": contact.get("street", ""),
+        "addressCity": contact.get("city", ""),
+        "addressRegion": contact.get("region", ""),
+        "postalCode": contact.get("postalCode", ""),
+        "addressCountry": contact.get("country", ""),
+        "deliveryInstructions": contact.get("deliveryInstructions", ""),
+        "streetAddressAdditional": contact.get("streetAdditional", "")
+    }
+    existing_firstname = contact.get("firstName", "")
+    existing_lastname = contact.get("lastName", "")
+    existing_email = contact.get("email", "")
+
+    address_changed = False
+    if filing_completing_party_mailing_address:
+        address_changed = not is_address_changed(existing_cp_mailing_address, filing_completing_party_mailing_address)
+
+    existing_name = {
+        "firstName": existing_firstname,
+        "lastName": existing_lastname
+    }
+    filing_name = {
+        "firstName": filing_firstname,
+        "lastName": filing_lastname
+    }
+
+    name_changed = False
+    if filing_firstname or filing_lastname:
+        name_changed = is_name_changed(existing_name, filing_name)
+
+    email_changed = False
+    if filing_email:
+        email_changed = not is_same_str(existing_email, filing_email)
+
+    return {
+        "error": msg,
+        "email_changed": email_changed,
+        "name_changed": name_changed,
+        "address_changed": address_changed
+    }
+
+def has_completing_party(filing_json: dict, filing_type: str) -> bool:
+    """Check if completing party is present in the filing."""
+    parties = filing_json.get("filing", {}).get(filing_type, {}).get("parties", [])
+    for party in parties:
+        roles = party.get("roles", [])
+        if any(role.get("roleType").lower().replace(" ", "_") == PartyRole.RoleTypes.COMPLETING_PARTY.value.lower() for role in roles):
+            return True
+    return False
+
+def validate_document_delivery_email_changed(email: str, org_id: int) -> dict:
+    """Validate document delivery email changed."""
+    result = {
+        "errors": [],
+        "email_changed": False
+    }
+
+    if not email:
+        return result
+
+    contacts_response = AccountService.get_contacts(current_app.config, org_id)
+    if contacts_response is None:
+        result["errors"].append({
+            "error": "Unable to verify document delivery email against account contacts."
+        })
+        return result
+    
+    contact = contacts_response["contacts"][0]
+    existing_email = contact.get("email", "")
+
+    email_changed = not is_same_str(existing_email, email)
+    result["email_changed"] = email_changed
+
+    return result
+
+def validate_permission_and_completing_party(business: Optional[Business], filing_json: dict, filing_type: str, msg: list, check_options: Optional[dict] = None
+) -> Optional[Error]:
+    """Validate completing party permission and changes."""
+    if not flags.is_on("enable-edit-completing-party-permission"):
+        return None
+    if check_options is None:
+        check_options = {}
+    check_name = check_options.get("check_name", True)
+    check_email = check_options.get("check_email", True)
+    check_address = check_options.get("check_address", True)
+    check_document_email = check_options.get("check_document_email", True)
+    # check if completing party is entered
+    completing_party_exists = has_completing_party(filing_json, filing_type)
+    completing_party_result = None
+    account_id = None
+    if get_request_context() and hasattr(request, "headers"):
+        account_id = request.headers.get("account-id",
+                                            request.headers.get("accountId", None))
+    if account_id and completing_party_exists and filing_json.get("filing", {}).get(filing_type, {}).get("parties"):
+        permission_error = check_completing_party_permission(msg, filing_type)
+        
+        if permission_error:
+            completing_party_result = validate_completing_party(filing_json, filing_type, account_id)
+            if completing_party_result.get("error"):
+                msg.extend(completing_party_result["error"])
+            
+            # Check if any relevant fields changed
+            should_check_permission = (
+                (check_email and completing_party_result.get("email_changed")) or
+                (check_name and completing_party_result.get("name_changed")) or
+                (check_address and completing_party_result.get("address_changed"))
+                )
+            if should_check_permission and permission_error:
+                return permission_error
+
+    if check_document_email:
+        return check_document_email_changes(filing_json, filing_type, account_id, msg)
+            
+    return None
+
+def check_document_email_changes(
+        filing_json: dict,
+        filing_type: str,
+        account_id: int,
+        msg: list
+) -> Optional[Error]:
+    """Check if document delivery email has changed."""
+    document_optional_email = filing_json.get("filing", {}).get("header", {}).get("documentOptionalEmail")
+    if not (document_optional_email and account_id):
+        return None
+    
+    email_validation_result = validate_document_delivery_email_changed(document_optional_email, int(account_id))
+    if email_validation_result.get("error"):
+        msg.extend(email_validation_result["error"])
+    if email_validation_result.get("email_changed"):
+        return check_completing_party_permission(msg, filing_type)
+
+    return None

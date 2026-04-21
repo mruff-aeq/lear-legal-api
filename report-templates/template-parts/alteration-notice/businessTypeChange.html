@@ -1,0 +1,27 @@
+<div class="no-page-break">
+    {% if newLegalType != previousLegalType %}
+        <div class="separator mt-4"></div>
+        <div class="section-title mt-4">Change of Business Type</div>
+        <div class="section-data mt-4">
+            {% if previousLegalTypeDescription %}
+                Changing from {{previousLegalTypeDescription}} to a <span class="bold">{{newLegalTypeDescription}}.</span>
+            {% endif %}
+            <div class="section-data mt-4">
+                <table class="section-data-table">
+                    <tr class="no-page-break">
+                    <td><span class="bold">Incorporation Number</span>
+                        <div class="pt-2">{{ business.identifier }}</div>
+                    </td>
+                    <td><span class="bold">Name of Company </span>
+                        {% if previousLegalName %}
+                             <div class="pt-2">{{previousLegalName}}</div>
+                        {% else %}
+                            <div class="pt-2">{{business.legalName}}</div>
+                        {% endif %}
+                    </td>          
+                    </tr>         
+                </table>
+            </div>
+        </div>
+    {% endif %}
+</div>
